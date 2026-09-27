@@ -12,6 +12,8 @@
 #include <cudf/utilities/error.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
+#include <rmm/cuda_stream.hpp>
+
 #include <cuda_runtime_api.h>
 
 #include <algorithm>
@@ -145,8 +147,8 @@ TEST_F(FusedForSplitTest, RawSegmentsReserveWireSpaceOncePerTile)
 
   ASSERT_GT(descriptors.size(), 1);
   auto round_up_16 = [](std::size_t bytes) { return (bytes + 15) & ~std::size_t{15}; };
-  auto expected_wire_size = round_up_16(
-    descriptors.size() * sizeof(cudf::detail::fused_for_segment));
+  auto expected_wire_size =
+    round_up_16(descriptors.size() * sizeof(cudf::detail::fused_for_segment));
   for (auto const& segment : descriptors) {
     EXPECT_EQ(segment.logical_width, 1);
     EXPECT_EQ(segment.wire_width, 1);
@@ -160,6 +162,30 @@ TEST_F(FusedForSplitTest, RawSegmentsReserveWireSpaceOncePerTile)
   auto expected = cudf::pack(input, stream, mr);
   auto decoded  = cudf::detail::decode_fused_for(std::move(packed), stream, mr);
   expect_packed_equal(expected, decoded, stream);
+}
+
+TEST_F(FusedForSplitTest, NonDefaultStreamPreservesAsyncDecodeLifetime)
+{
+  rmm::cuda_stream stream;
+  auto const stream_view = stream.view();
+  auto const mr          = cudf::get_current_device_resource_ref();
+
+  constexpr cudf::size_type rows = 16'384;
+  std::vector<std::int64_t> values(rows);
+  for (cudf::size_type i = 0; i < rows; ++i) {
+    values[i] = -500'000 + (i % 2'048);
+  }
+
+  cudf::test::fixed_width_column_wrapper<std::int64_t> column(values.begin(), values.end());
+  cudf::table_view input{{column}};
+  auto expected = cudf::pack(input, stream_view, mr);
+  auto packed   = cudf::detail::pack_fused_for(input, stream_view, mr);
+
+  // decode_fused_for launches asynchronously and destroys the moved wire
+  // buffer on return. Its deallocation must remain ordered after the decode
+  // on this non-default stream.
+  auto decoded = cudf::detail::decode_fused_for(std::move(packed), stream_view, mr);
+  expect_packed_equal(expected, decoded, stream_view);
 }
 
 TEST_F(FusedForSplitTest, RoundTripsNullableSliceAcrossPartitions)
