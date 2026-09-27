@@ -573,19 +573,18 @@ CUDF_KERNEL void copy_partitions_fused_for(IndexToDstBuf index_to_buffer,
   }
   __syncthreads();
 
-  auto copy       = destination;
-  copy.dst_offset = wire_offset;
+  auto copy = destination;
   if (copy.is_offsets) {
     if (copy.element_size == 4) {
       copy_buffer<block_size, true, int32_t>(
-        wire_buffer, src_bufs[src_buf_index], threadIdx.x, copy, blockDim.x);
+        wire_buffer + wire_offset, src_bufs[src_buf_index], threadIdx.x, copy, blockDim.x);
     } else {
       copy_buffer<block_size, true, int64_t>(
-        wire_buffer, src_bufs[src_buf_index], threadIdx.x, copy, blockDim.x);
+        wire_buffer + wire_offset, src_bufs[src_buf_index], threadIdx.x, copy, blockDim.x);
     }
   } else {
     copy_buffer<block_size, false>(
-      wire_buffer, src_bufs[src_buf_index], threadIdx.x, copy, blockDim.x);
+      wire_buffer + wire_offset, src_bufs[src_buf_index], threadIdx.x, copy, blockDim.x);
   }
   __syncthreads();
   if (threadIdx.x == 0) { buf_info[buf_index].valid_count = copy.valid_count; }

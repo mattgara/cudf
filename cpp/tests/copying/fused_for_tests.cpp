@@ -5,6 +5,7 @@
 
 #include <cudf_test/base_fixture.hpp>
 #include <cudf_test/column_wrapper.hpp>
+#include <cudf_test/table_utilities.hpp>
 
 #include <cudf/contiguous_split.hpp>
 #include <cudf/copying.hpp>
@@ -24,15 +25,6 @@
 
 struct FusedForSplitTest : public cudf::test::BaseFixture {};
 
-std::vector<std::uint8_t> copy_to_host(rmm::device_buffer const& input, cuda::stream_ref stream)
-{
-  std::vector<std::uint8_t> result(input.size());
-  CUDF_CUDA_TRY(cudaMemcpyAsync(
-    result.data(), input.data(), input.size(), cudaMemcpyDeviceToHost, stream.get()));
-  CUDF_CUDA_TRY(cudaStreamSynchronize(stream.get()));
-  return result;
-}
-
 std::vector<cudf::detail::fused_for_segment> copy_descriptors_to_host(
   cudf::detail::fused_for_packed_columns const& input, cuda::stream_ref stream)
 {
@@ -48,9 +40,9 @@ std::vector<cudf::detail::fused_for_segment> copy_descriptors_to_host(
   return result;
 }
 
-void expect_packed_equal(cudf::packed_columns const& expected,
-                         cudf::packed_columns const& actual,
-                         cuda::stream_ref stream)
+void expect_packed_equivalent(cudf::packed_columns const& expected,
+                              cudf::packed_columns const& actual,
+                              cuda::stream_ref stream)
 {
   ASSERT_NE(expected.metadata, nullptr);
   ASSERT_NE(actual.metadata, nullptr);
@@ -58,7 +50,9 @@ void expect_packed_equal(cudf::packed_columns const& expected,
   ASSERT_NE(actual.gpu_data, nullptr);
   EXPECT_EQ(*expected.metadata, *actual.metadata);
   EXPECT_EQ(expected.gpu_data->size(), actual.gpu_data->size());
-  EXPECT_EQ(copy_to_host(*expected.gpu_data, stream), copy_to_host(*actual.gpu_data, stream));
+  auto const expected_table = cudf::unpack(expected);
+  auto const actual_table   = cudf::unpack(actual);
+  CUDF_TEST_EXPECT_TABLES_EQUAL(expected_table, actual_table, stream);
 }
 
 void expect_fused_for_round_trip(cudf::table_view const& input,
@@ -72,7 +66,7 @@ void expect_fused_for_round_trip(cudf::table_view const& input,
   ASSERT_EQ(expected.size(), packed.size());
   for (std::size_t i = 0; i < packed.size(); ++i) {
     auto decoded = cudf::detail::decode_fused_for(std::move(packed[i]), stream, mr);
-    expect_packed_equal(expected[i].data, decoded, stream);
+    expect_packed_equivalent(expected[i].data, decoded, stream);
   }
 }
 
@@ -127,7 +121,7 @@ TEST_F(FusedForSplitTest, UsesAllByteAlignedWidthsAndPreservesRawColumns)
 
   auto expected = cudf::pack(input, stream, mr);
   auto decoded  = cudf::detail::decode_fused_for(std::move(packed), stream, mr);
-  expect_packed_equal(expected, decoded, stream);
+  expect_packed_equivalent(expected, decoded, stream);
 }
 
 TEST_F(FusedForSplitTest, RawSegmentsReserveWireSpaceOncePerTile)
@@ -161,7 +155,7 @@ TEST_F(FusedForSplitTest, RawSegmentsReserveWireSpaceOncePerTile)
 
   auto expected = cudf::pack(input, stream, mr);
   auto decoded  = cudf::detail::decode_fused_for(std::move(packed), stream, mr);
-  expect_packed_equal(expected, decoded, stream);
+  expect_packed_equivalent(expected, decoded, stream);
 }
 
 TEST_F(FusedForSplitTest, NonDefaultStreamPreservesAsyncDecodeLifetime)
@@ -185,7 +179,7 @@ TEST_F(FusedForSplitTest, NonDefaultStreamPreservesAsyncDecodeLifetime)
   // buffer on return. Its deallocation must remain ordered after the decode
   // on this non-default stream.
   auto decoded = cudf::detail::decode_fused_for(std::move(packed), stream_view, mr);
-  expect_packed_equal(expected, decoded, stream_view);
+  expect_packed_equivalent(expected, decoded, stream_view);
 }
 
 TEST_F(FusedForSplitTest, RoundTripsNullableSliceAcrossPartitions)
@@ -236,7 +230,7 @@ TEST_F(FusedForSplitTest, Decimal32And64PreserveScale)
 
   auto expected = cudf::pack(input, stream, mr);
   auto decoded  = cudf::detail::decode_fused_for(std::move(packed), stream, mr);
-  expect_packed_equal(expected, decoded, stream);
+  expect_packed_equivalent(expected, decoded, stream);
 }
 
 TEST_F(FusedForSplitTest, ConstantsAndSignedExtremaRoundTrip)
@@ -269,7 +263,7 @@ TEST_F(FusedForSplitTest, PreservesMetadataOnlyZeroColumnTable)
     EXPECT_EQ(packed[i].segment_count, 0);
     EXPECT_EQ(packed[i].logical_data_size, 0);
     auto decoded = cudf::detail::decode_fused_for(std::move(packed[i]), stream, mr);
-    expect_packed_equal(expected[i].data, decoded, stream);
+    expect_packed_equivalent(expected[i].data, decoded, stream);
   }
 }
 
