@@ -128,6 +128,40 @@ TEST_F(FusedForSplitTest, UsesAllByteAlignedWidthsAndPreservesRawColumns)
   expect_packed_equal(expected, decoded, stream);
 }
 
+TEST_F(FusedForSplitTest, RawSegmentsReserveWireSpaceOncePerTile)
+{
+  constexpr cudf::size_type rows = 65'536;
+  std::vector<float> values(rows);
+  for (cudf::size_type i = 0; i < rows; ++i) {
+    values[i] = static_cast<float>(i) * 0.25F;
+  }
+
+  cudf::test::fixed_width_column_wrapper<float> column(values.begin(), values.end());
+  cudf::table_view input{{column}};
+  auto const stream = cudf::get_default_stream();
+  auto const mr     = cudf::get_current_device_resource_ref();
+  auto packed       = cudf::detail::pack_fused_for(input, stream, mr);
+  auto descriptors  = copy_descriptors_to_host(packed, stream);
+
+  ASSERT_GT(descriptors.size(), 1);
+  auto round_up_16 = [](std::size_t bytes) { return (bytes + 15) & ~std::size_t{15}; };
+  auto expected_wire_size = round_up_16(
+    descriptors.size() * sizeof(cudf::detail::fused_for_segment));
+  for (auto const& segment : descriptors) {
+    EXPECT_EQ(segment.logical_width, 1);
+    EXPECT_EQ(segment.wire_width, 1);
+    auto const segment_bytes = static_cast<std::size_t>(segment.element_count);
+    ASSERT_LE(segment.wire_offset, packed.wire_data->size());
+    EXPECT_LE(segment_bytes, packed.wire_data->size() - segment.wire_offset);
+    expected_wire_size += round_up_16(segment_bytes);
+  }
+  EXPECT_EQ(packed.wire_data->size(), expected_wire_size);
+
+  auto expected = cudf::pack(input, stream, mr);
+  auto decoded  = cudf::detail::decode_fused_for(std::move(packed), stream, mr);
+  expect_packed_equal(expected, decoded, stream);
+}
+
 TEST_F(FusedForSplitTest, RoundTripsNullableSliceAcrossPartitions)
 {
   constexpr cudf::size_type rows = 25'000;
