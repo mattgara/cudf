@@ -207,6 +207,38 @@ TEST_F(FusedForSplitTest, RoundTripsNullableSliceAcrossPartitions)
   expect_fused_for_round_trip(sliced.front(), {4'000, 12'000, 20'000});
 }
 
+TEST_F(FusedForSplitTest, Decimal32And64PreserveScale)
+{
+  constexpr cudf::size_type rows = 16'384;
+  std::vector<std::int32_t> decimal32_values(rows);
+  std::vector<std::int64_t> decimal64_values(rows);
+  for (cudf::size_type i = 0; i < rows; ++i) {
+    decimal32_values[i] = -50'000 + (i % 4'000);
+    decimal64_values[i] = -5'000'000'000'000LL + (i % 20'000);
+  }
+
+  cudf::test::fixed_point_column_wrapper<std::int32_t> decimal32(
+    decimal32_values.begin(), decimal32_values.end(), numeric::scale_type{-2});
+  cudf::test::fixed_point_column_wrapper<std::int64_t> decimal64(
+    decimal64_values.begin(), decimal64_values.end(), numeric::scale_type{-4});
+  cudf::table_view input{{decimal32, decimal64}};
+
+  auto const stream = cudf::get_default_stream();
+  auto const mr     = cudf::get_current_device_resource_ref();
+  auto packed       = cudf::detail::pack_fused_for(input, stream, mr);
+  auto descriptors  = copy_descriptors_to_host(packed, stream);
+  EXPECT_TRUE(std::any_of(descriptors.begin(), descriptors.end(), [](auto const& segment) {
+    return segment.logical_width == 4 && segment.wire_width < segment.logical_width;
+  }));
+  EXPECT_TRUE(std::any_of(descriptors.begin(), descriptors.end(), [](auto const& segment) {
+    return segment.logical_width == 8 && segment.wire_width < segment.logical_width;
+  }));
+
+  auto expected = cudf::pack(input, stream, mr);
+  auto decoded  = cudf::detail::decode_fused_for(std::move(packed), stream, mr);
+  expect_packed_equal(expected, decoded, stream);
+}
+
 TEST_F(FusedForSplitTest, ConstantsAndSignedExtremaRoundTrip)
 {
   constexpr cudf::size_type rows = 4'096;
