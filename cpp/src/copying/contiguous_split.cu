@@ -565,11 +565,13 @@ CUDF_KERNEL void copy_partitions_fused_for(IndexToDstBuf index_to_buffer,
   }
 
   auto const bytes = destination.num_elements * static_cast<std::size_t>(destination.element_size);
-  auto const wire_offset = reserve_fused_for_bytes(wire_offsets, destination.dst_buf_index, bytes);
+  __shared__ std::size_t wire_offset;
   if (threadIdx.x == 0) {
+    wire_offset = reserve_fused_for_bytes(wire_offsets, destination.dst_buf_index, bytes);
     segments[segment_index] = detail::fused_for_segment{
       wire_offset, destination.dst_offset, 0, static_cast<std::uint32_t>(bytes), 1, 1, 0};
   }
+  __syncthreads();
 
   auto copy       = destination;
   copy.dst_offset = wire_offset;
@@ -1403,7 +1405,8 @@ struct packed_split_indices_and_src_buf_info {
                                         std::size_t num_partitions,
                                         cudf::size_type num_src_bufs,
                                         cuda::stream_ref stream,
-                                        rmm::device_async_resource_ref temp_mr)
+                                        rmm::device_async_resource_ref temp_mr,
+                                        bool mark_fused_for)
     : indices_size(cudf::util::round_up_safe((num_partitions + 1) * sizeof(int64_t), split_align)),
       src_buf_info_size(
         cudf::util::round_up_safe(num_src_bufs * sizeof(src_buf_info), split_align)),
@@ -1422,7 +1425,7 @@ struct packed_split_indices_and_src_buf_info {
 
     // setup source buf info
     setup_source_buf_info(input.begin(), input.end(), h_src_buf_info, h_src_buf_info, stream);
-    mark_top_level_fused_for_buffers(input, h_src_buf_info);
+    if (mark_fused_for) { mark_top_level_fused_for_buffers(input, h_src_buf_info); }
 
     offset_stack_partition_size = compute_offset_stack_size(input.begin(), input.end());
     offset_stack_size           = offset_stack_partition_size * num_partitions * sizeof(size_type);
@@ -1626,7 +1629,7 @@ std::unique_ptr<packed_partition_buf_size_and_dst_buf_info> compute_splits(
   auto const d_buf_sizes    = partition_buf_size_and_dst_buf_info->d_buf_sizes;
 
   auto const split_indices_and_src_buf_info = packed_split_indices_and_src_buf_info(
-    input, splits, num_partitions, num_src_bufs, stream, temp_mr);
+    input, splits, num_partitions, num_src_bufs, stream, temp_mr, retain_fused_src_info);
 
   auto const d_src_buf_info = split_indices_and_src_buf_info.d_src_buf_info;
   auto const offset_stack_partition_size =
