@@ -11,6 +11,7 @@
 #include <cudf/contiguous_split.hpp>
 #include <cudf/detail/contiguous_split.hpp>
 #include <cudf/detail/copy.hpp>
+#include <cudf/detail/fused_for.hpp>
 #include <cudf/detail/iterator.cuh>
 #include <cudf/detail/null_mask.hpp>
 #include <cudf/detail/nvtx/ranges.hpp>
@@ -32,9 +33,13 @@
 
 #include <rmm/exec_policy.hpp>
 
+#include <cub/block/block_reduce.cuh>
+#include <cub/thread/thread_operators.cuh>
 #include <cuda/functional>
 #include <cuda/iterator>
 #include <cuda/std/functional>
+#include <cuda/std/limits>
+#include <cuda/std/type_traits>
 #include <cuda/std/utility>
 #include <cuda/stream>
 #include <thrust/binary_search.h>
@@ -57,6 +62,7 @@
 #include <optional>
 #include <stdexcept>
 #include <tuple>
+#include <type_traits>
 
 namespace cudf {
 namespace {
@@ -69,6 +75,9 @@ static constexpr std::size_t split_align = 64;
 // The number of `desired_batch_size` batches equals the number of CUDA blocks
 // that will be used for the main kernel launch (`copy_partitions`).
 static constexpr std::size_t desired_batch_size = 1 * 1024 * 1024;
+// Fused FOR keeps one numeric tile in shared memory so each source value is
+// read only once while the block computes its base, width, and encoded bytes.
+static constexpr std::size_t fused_for_batch_size = 8 * 1024;
 
 /**
  * @brief Struct which contains information on a source buffer.
@@ -119,6 +128,7 @@ struct src_buf_info {
   bool is_validity;                   // if I am a validity buffer
   size_type column_offset;            // offset in the case of a sliced column
   size_type full_copy_row_count{-1};  // rows I copy in full, or -1 if I follow the splits
+  bool for_eligible{false};           // top-level integral data buffer
 };
 
 /**
@@ -373,6 +383,270 @@ CUDF_KERNEL void copy_partitions(IndexToDstBuf index_to_buffer,
   }
 }
 
+__device__ std::size_t reserve_fused_for_bytes(std::uint64_t* offsets,
+                                               int partition,
+                                               std::size_t bytes)
+{
+  auto const aligned_bytes = (bytes + 15) & ~std::size_t{15};
+  return atomicAdd(reinterpret_cast<unsigned long long*>(offsets + partition),
+                   static_cast<unsigned long long>(aligned_bytes));
+}
+
+template <typename T>
+__device__ std::uint8_t fused_for_width(T minimum, T maximum)
+{
+  using unsigned_type = cuda::std::make_unsigned_t<T>;
+  auto const range    = static_cast<unsigned_type>(maximum) - static_cast<unsigned_type>(minimum);
+  if (range <= cuda::std::numeric_limits<std::uint8_t>::max()) { return 1; }
+  if constexpr (sizeof(T) > 2) {
+    if (range <= cuda::std::numeric_limits<std::uint16_t>::max()) { return 2; }
+  }
+  if constexpr (sizeof(T) > 4) {
+    if (range <= cuda::std::numeric_limits<std::uint32_t>::max()) { return 4; }
+  }
+  return sizeof(T);
+}
+
+template <typename T, int block_size>
+__device__ void encode_fused_for_tile(uint8_t* wire_buffer,
+                                      std::uint64_t* wire_offsets,
+                                      detail::fused_for_segment* segments,
+                                      int segment_index,
+                                      T const* source,
+                                      dst_buf_info const& destination)
+{
+  extern __shared__ __align__(16) uint8_t shared_bytes[];
+  auto* const values = reinterpret_cast<T*>(shared_bytes);
+
+  auto const count = destination.num_elements;
+  for (std::size_t i = threadIdx.x; i < count; i += blockDim.x) {
+    values[i] = source[destination.src_element_index + i];
+  }
+  __syncthreads();
+
+  T thread_min = cuda::std::numeric_limits<T>::max();
+  T thread_max = cuda::std::numeric_limits<T>::lowest();
+  for (std::size_t i = threadIdx.x; i < count; i += blockDim.x) {
+    thread_min = cuda::std::min(thread_min, values[i]);
+    thread_max = cuda::std::max(thread_max, values[i]);
+  }
+
+  using block_reduce = cub::BlockReduce<T, block_size>;
+  __shared__ typename block_reduce::TempStorage min_storage;
+  __shared__ typename block_reduce::TempStorage max_storage;
+  auto const minimum = block_reduce(min_storage).Reduce(thread_min, cuda::minimum{});
+  __syncthreads();
+  auto const maximum = block_reduce(max_storage).Reduce(thread_max, cuda::maximum{});
+
+  __shared__ T base;
+  __shared__ std::uint8_t width;
+  __shared__ std::size_t wire_offset;
+  if (threadIdx.x == 0) {
+    base             = minimum;
+    width            = fused_for_width(minimum, maximum);
+    auto const bytes = count * static_cast<std::size_t>(width);
+    wire_offset      = reserve_fused_for_bytes(wire_offsets, destination.dst_buf_index, bytes);
+
+    using unsigned_type = cuda::std::make_unsigned_t<T>;
+    segments[segment_index] =
+      detail::fused_for_segment{wire_offset,
+                                destination.dst_offset,
+                                static_cast<std::uint64_t>(static_cast<unsigned_type>(minimum)),
+                                static_cast<std::uint32_t>(count),
+                                static_cast<std::uint8_t>(sizeof(T)),
+                                width,
+                                0};
+  }
+  __syncthreads();
+
+  using unsigned_type = cuda::std::make_unsigned_t<T>;
+  for (std::size_t i = threadIdx.x; i < count; i += blockDim.x) {
+    if (width == sizeof(T)) {
+      reinterpret_cast<T*>(wire_buffer + wire_offset)[i] = values[i];
+      continue;
+    }
+
+    auto const offset = static_cast<unsigned_type>(values[i]) - static_cast<unsigned_type>(base);
+    if (width == 1) {
+      reinterpret_cast<std::uint8_t*>(wire_buffer + wire_offset)[i] =
+        static_cast<std::uint8_t>(offset);
+    } else if (width == 2) {
+      reinterpret_cast<std::uint16_t*>(wire_buffer + wire_offset)[i] =
+        static_cast<std::uint16_t>(offset);
+    } else {
+      reinterpret_cast<std::uint32_t*>(wire_buffer + wire_offset)[i] =
+        static_cast<std::uint32_t>(offset);
+    }
+  }
+}
+
+template <int block_size, typename IndexToDstBuf>
+CUDF_KERNEL void copy_partitions_fused_for(IndexToDstBuf index_to_buffer,
+                                           uint8_t const** src_bufs,
+                                           src_buf_info const* src_info,
+                                           dst_buf_info* buf_info,
+                                           size_type const* batch_offsets,
+                                           size_type num_src_bufs,
+                                           std::uint64_t* wire_offsets)
+{
+  auto const buf_index     = blockIdx.x;
+  auto const src_buf_index = buf_info[buf_index].src_buf_index;
+  auto const& source       = src_info[src_buf_index];
+  auto const destination   = buf_info[buf_index];
+  auto* const wire_buffer  = index_to_buffer(buf_index);
+  auto* const segments     = reinterpret_cast<detail::fused_for_segment*>(wire_buffer);
+  auto const segment_index = buf_index - batch_offsets[destination.dst_buf_index * num_src_bufs];
+
+  if (source.for_eligible && destination.num_elements > 0) {
+    auto const* src = src_bufs[src_buf_index];
+    switch (source.type) {
+      case type_id::INT16:
+        encode_fused_for_tile<int16_t, block_size>(wire_buffer,
+                                                   wire_offsets,
+                                                   segments,
+                                                   segment_index,
+                                                   reinterpret_cast<int16_t const*>(src),
+                                                   destination);
+        return;
+      case type_id::UINT16:
+        encode_fused_for_tile<uint16_t, block_size>(wire_buffer,
+                                                    wire_offsets,
+                                                    segments,
+                                                    segment_index,
+                                                    reinterpret_cast<uint16_t const*>(src),
+                                                    destination);
+        return;
+      case type_id::INT32:
+      case type_id::TIMESTAMP_DAYS:
+      case type_id::DURATION_DAYS:
+      case type_id::DECIMAL32:
+        encode_fused_for_tile<int32_t, block_size>(wire_buffer,
+                                                   wire_offsets,
+                                                   segments,
+                                                   segment_index,
+                                                   reinterpret_cast<int32_t const*>(src),
+                                                   destination);
+        return;
+      case type_id::UINT32:
+        encode_fused_for_tile<uint32_t, block_size>(wire_buffer,
+                                                    wire_offsets,
+                                                    segments,
+                                                    segment_index,
+                                                    reinterpret_cast<uint32_t const*>(src),
+                                                    destination);
+        return;
+      case type_id::INT64:
+      case type_id::TIMESTAMP_SECONDS:
+      case type_id::TIMESTAMP_MILLISECONDS:
+      case type_id::TIMESTAMP_MICROSECONDS:
+      case type_id::TIMESTAMP_NANOSECONDS:
+      case type_id::DURATION_SECONDS:
+      case type_id::DURATION_MILLISECONDS:
+      case type_id::DURATION_MICROSECONDS:
+      case type_id::DURATION_NANOSECONDS:
+      case type_id::DECIMAL64:
+        encode_fused_for_tile<int64_t, block_size>(wire_buffer,
+                                                   wire_offsets,
+                                                   segments,
+                                                   segment_index,
+                                                   reinterpret_cast<int64_t const*>(src),
+                                                   destination);
+        return;
+      case type_id::UINT64:
+        encode_fused_for_tile<uint64_t, block_size>(wire_buffer,
+                                                    wire_offsets,
+                                                    segments,
+                                                    segment_index,
+                                                    reinterpret_cast<uint64_t const*>(src),
+                                                    destination);
+        return;
+      default: break;
+    }
+  }
+
+  auto const bytes = destination.num_elements * static_cast<std::size_t>(destination.element_size);
+  auto const wire_offset = reserve_fused_for_bytes(wire_offsets, destination.dst_buf_index, bytes);
+  if (threadIdx.x == 0) {
+    segments[segment_index] = detail::fused_for_segment{
+      wire_offset, destination.dst_offset, 0, static_cast<std::uint32_t>(bytes), 1, 1, 0};
+  }
+
+  auto copy       = destination;
+  copy.dst_offset = wire_offset;
+  if (copy.is_offsets) {
+    if (copy.element_size == 4) {
+      copy_buffer<block_size, true, int32_t>(
+        wire_buffer, src_bufs[src_buf_index], threadIdx.x, copy, blockDim.x);
+    } else {
+      copy_buffer<block_size, true, int64_t>(
+        wire_buffer, src_bufs[src_buf_index], threadIdx.x, copy, blockDim.x);
+    }
+  } else {
+    copy_buffer<block_size, false>(
+      wire_buffer, src_bufs[src_buf_index], threadIdx.x, copy, blockDim.x);
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) { buf_info[buf_index].valid_count = copy.valid_count; }
+}
+
+template <typename Logical, typename Offset>
+__device__ void decode_fused_for_values(uint8_t const* wire,
+                                        uint8_t* logical,
+                                        detail::fused_for_segment const& segment)
+{
+  auto const* offsets = reinterpret_cast<Offset const*>(wire + segment.wire_offset);
+  auto* values        = reinterpret_cast<Logical*>(logical + segment.logical_offset);
+  auto const base     = static_cast<Logical>(segment.reference);
+  for (std::size_t i = threadIdx.x; i < segment.element_count; i += blockDim.x) {
+    values[i] = base + static_cast<Logical>(offsets[i]);
+  }
+}
+
+CUDF_KERNEL void decode_fused_for_segments(uint8_t const* wire,
+                                           uint8_t* logical,
+                                           detail::fused_for_segment const* segments,
+                                           std::size_t wire_size,
+                                           std::size_t logical_size)
+{
+  auto const& segment      = segments[blockIdx.x];
+  auto const logical_width = static_cast<std::size_t>(segment.logical_width);
+  auto const wire_width    = static_cast<std::size_t>(segment.wire_width);
+  auto const valid_logical_width =
+    logical_width == 1 || logical_width == 2 || logical_width == 4 || logical_width == 8;
+  auto const valid_wire_width =
+    wire_width == 1 || wire_width == 2 || wire_width == 4 || wire_width == 8;
+  if (!valid_logical_width || !valid_wire_width || wire_width > logical_width) { return; }
+
+  auto const logical_bytes = static_cast<std::size_t>(segment.element_count) * logical_width;
+  auto const wire_bytes    = static_cast<std::size_t>(segment.element_count) * wire_width;
+  if (segment.logical_offset > logical_size ||
+      logical_bytes > logical_size - segment.logical_offset || segment.wire_offset > wire_size ||
+      wire_bytes > wire_size - segment.wire_offset) {
+    return;
+  }
+
+  if (segment.wire_width == segment.logical_width) {
+    for (std::size_t i = threadIdx.x; i < logical_bytes; i += blockDim.x) {
+      logical[segment.logical_offset + i] = wire[segment.wire_offset + i];
+    }
+    return;
+  }
+
+  if (segment.logical_width == 2 && segment.wire_width == 1) {
+    decode_fused_for_values<std::uint16_t, std::uint8_t>(wire, logical, segment);
+  } else if (segment.logical_width == 4 && segment.wire_width == 1) {
+    decode_fused_for_values<std::uint32_t, std::uint8_t>(wire, logical, segment);
+  } else if (segment.logical_width == 4 && segment.wire_width == 2) {
+    decode_fused_for_values<std::uint32_t, std::uint16_t>(wire, logical, segment);
+  } else if (segment.logical_width == 8 && segment.wire_width == 1) {
+    decode_fused_for_values<std::uint64_t, std::uint8_t>(wire, logical, segment);
+  } else if (segment.logical_width == 8 && segment.wire_width == 2) {
+    decode_fused_for_values<std::uint64_t, std::uint16_t>(wire, logical, segment);
+  } else if (segment.logical_width == 8 && segment.wire_width == 4) {
+    decode_fused_for_values<std::uint64_t, std::uint32_t>(wire, logical, segment);
+  }
+}
+
 // The block of functions below are all related:
 //
 // compute_offset_stack_size()
@@ -483,6 +757,46 @@ size_type count_src_bufs(InputIter begin, InputIter end)
   return std::accumulate(buf_iter, buf_iter + std::distance(begin, end), 0);
 }
 
+bool supports_fused_for(type_id id)
+{
+  switch (id) {
+    case type_id::INT16:
+    case type_id::INT32:
+    case type_id::INT64:
+    case type_id::UINT16:
+    case type_id::UINT32:
+    case type_id::UINT64:
+    case type_id::TIMESTAMP_DAYS:
+    case type_id::TIMESTAMP_SECONDS:
+    case type_id::TIMESTAMP_MILLISECONDS:
+    case type_id::TIMESTAMP_MICROSECONDS:
+    case type_id::TIMESTAMP_NANOSECONDS:
+    case type_id::DURATION_DAYS:
+    case type_id::DURATION_SECONDS:
+    case type_id::DURATION_MILLISECONDS:
+    case type_id::DURATION_MICROSECONDS:
+    case type_id::DURATION_NANOSECONDS:
+    case type_id::DECIMAL32:
+    case type_id::DECIMAL64: return true;
+    default: return false;
+  }
+}
+
+void mark_top_level_fused_for_buffers(table_view const& input, src_buf_info* infos)
+{
+  auto* current = infos;
+  std::for_each(input.begin(), input.end(), [&current](column_view const& column) {
+    if (column.nullable()) { ++current; }
+
+    auto* const data_info = current++;
+    if (column.num_children() == 0 && supports_fused_for(column.type().id())) {
+      data_info->for_eligible = true;
+    }
+
+    current += count_src_bufs(column.child_begin(), column.child_end());
+  });
+}
+
 /**
  * @brief Computes source buffer information for the copy kernel.
  *
@@ -551,9 +865,7 @@ struct buf_info_functor {
   std::pair<src_buf_info*, size_type> operator()(
     column_view const&, src_buf_info*, int, int, int, cuda::stream_ref)
     requires(not cudf::is_fixed_width<T>())
-  {
-    CUDF_FAIL("Unsupported type");
-  }
+  { CUDF_FAIL("Unsupported type"); }
 
  private:
   std::pair<src_buf_info*, size_type> add_null_buffer(column_view const& col,
@@ -657,7 +969,7 @@ std::pair<src_buf_info*, size_type> buf_info_functor::operator()<cudf::list_view
   // info for the offsets buffer
   auto offset_col = current;
   *current        = src_buf_info(type_id::INT32,
-                          // note: offsets can be null in the case where the lists column
+                                 // note: offsets can be null in the case where the lists column
                           // has been created with empty_like().
                           lcv.offsets(),
                           offset_stack_pos,
@@ -961,14 +1273,16 @@ template <typename InputIter, typename BufInfo>
 BufInfo populate_metadata(InputIter begin,
                           InputIter end,
                           BufInfo info_begin,
-                          detail::metadata_builder& mb)
+                          detail::metadata_builder& mb,
+                          bool use_src_null_count)
 {
   auto current_info = info_begin;
-  std::for_each(begin, end, [&current_info, &mb](column_view const& src) {
-    build_output_column_metadata<BufInfo>(src, current_info, mb, true);
+  std::for_each(begin, end, [&current_info, &mb, use_src_null_count](column_view const& src) {
+    build_output_column_metadata<BufInfo>(src, current_info, mb, use_src_null_count);
 
     // children
-    current_info = populate_metadata(src.child_begin(), src.child_end(), current_info, mb);
+    current_info =
+      populate_metadata(src.child_begin(), src.child_end(), current_info, mb, use_src_null_count);
   });
 
   return current_info;
@@ -1026,23 +1340,17 @@ struct size_of_helper {
   template <typename T>
   constexpr int __device__ operator()() const
     requires(!is_fixed_width<T>() && !std::is_same_v<T, cudf::string_view>)
-  {
-    return 0;
-  }
+  { return 0; }
 
   template <typename T>
   constexpr int __device__ operator()() const
     requires(!is_fixed_width<T>() && std::is_same_v<T, cudf::string_view>)
-  {
-    return sizeof(cudf::device_storage_type_t<int8_t>);
-  }
+  { return sizeof(cudf::device_storage_type_t<int8_t>); }
 
   template <typename T>
   constexpr int __device__ operator()() const noexcept
     requires(is_fixed_width<T>())
-  {
-    return sizeof(cudf::device_storage_type_t<T>);
-  }
+  { return sizeof(cudf::device_storage_type_t<T>); }
 };
 
 /**
@@ -1114,6 +1422,7 @@ struct packed_split_indices_and_src_buf_info {
 
     // setup source buf info
     setup_source_buf_info(input.begin(), input.end(), h_src_buf_info, h_src_buf_info, stream);
+    mark_top_level_fused_for_buffers(input, h_src_buf_info);
 
     offset_stack_partition_size = compute_offset_stack_size(input.begin(), input.end());
     offset_stack_size           = offset_stack_partition_size * num_partitions * sizeof(size_type);
@@ -1196,6 +1505,7 @@ struct packed_partition_buf_size_and_dst_buf_info {
   rmm::device_uvector<uint8_t> d_buf_sizes_and_dst_info;
   std::size_t* const d_buf_sizes;
   device_span<dst_buf_info> const d_dst_buf_info;
+  std::optional<rmm::device_uvector<src_buf_info>> d_fused_src_info;
 };
 
 // Packed block of memory 3:
@@ -1305,7 +1615,8 @@ std::unique_ptr<packed_partition_buf_size_and_dst_buf_info> compute_splits(
   cudf::size_type num_src_bufs,
   std::size_t num_bufs,
   cuda::stream_ref stream,
-  rmm::device_async_resource_ref temp_mr)
+  rmm::device_async_resource_ref temp_mr,
+  bool retain_fused_src_info = false)
 {
   auto partition_buf_size_and_dst_buf_info =
     std::make_unique<packed_partition_buf_size_and_dst_buf_info>(
@@ -1322,6 +1633,15 @@ std::unique_ptr<packed_partition_buf_size_and_dst_buf_info> compute_splits(
     split_indices_and_src_buf_info.offset_stack_partition_size;
   auto const d_offset_stack = split_indices_and_src_buf_info.d_offset_stack;
   auto const d_indices      = split_indices_and_src_buf_info.d_indices;
+
+  if (retain_fused_src_info) {
+    partition_buf_size_and_dst_buf_info->d_fused_src_info.emplace(num_src_bufs, stream, temp_mr);
+    CUDF_CUDA_TRY(cudaMemcpyAsync(partition_buf_size_and_dst_buf_info->d_fused_src_info->data(),
+                                  d_src_buf_info,
+                                  num_src_bufs * sizeof(src_buf_info),
+                                  cudaMemcpyDeviceToDevice,
+                                  stream.get()));
+  }
 
   // compute sizes of each column in each partition, including alignment.
   thrust::transform(
@@ -1466,7 +1786,8 @@ std::tuple<size_type, std::size_t, std::unique_ptr<packed_partition_buf_size_and
 compute_num_bufs_and_splits(cudf::table_view const& input,
                             std::vector<size_type> const& splits,
                             cuda::stream_ref stream,
-                            rmm::device_async_resource_ref temp_mr)
+                            rmm::device_async_resource_ref temp_mr,
+                            bool retain_fused_src_info = false)
 {
   std::size_t const num_partitions = splits.size() + 1;
   auto num_src_bufs                = count_src_bufs(input.begin(), input.end());
@@ -1475,8 +1796,8 @@ compute_num_bufs_and_splits(cudf::table_view const& input,
   // First pass over the source tables to generate a `dst_buf_info` per split and column buffer
   // (`num_bufs`). After this, contiguous_split uses `dst_buf_info` to further subdivide the work
   // into 1MB batches in `compute_batches`
-  auto partition_buf_size_and_dst_buf_info =
-    compute_splits(input, splits, num_partitions, num_src_bufs, num_bufs, stream, temp_mr);
+  auto partition_buf_size_and_dst_buf_info = compute_splits(
+    input, splits, num_partitions, num_src_bufs, num_bufs, stream, temp_mr, retain_fused_src_info);
 
   return std::make_tuple(num_src_bufs, num_bufs, std::move(partition_buf_size_and_dst_buf_info));
 }
@@ -1783,6 +2104,7 @@ std::unique_ptr<chunk_iteration_state> compute_batches(int num_bufs,
                                                        dst_buf_info* const d_dst_buf_info,
                                                        std::size_t const* const h_buf_sizes,
                                                        std::size_t num_partitions,
+                                                       std::size_t target_batch_size,
                                                        std::size_t user_buffer_size,
                                                        cuda::stream_ref stream,
                                                        rmm::device_async_resource_ref temp_mr)
@@ -1799,7 +2121,7 @@ std::unique_ptr<chunk_iteration_state> compute_batches(int num_bufs,
     d_dst_buf_info + num_bufs,
     batches.begin(),
     cuda::proclaim_return_type<cuda::std::pair<std::size_t, std::size_t>>(
-      [desired_batch_size = desired_batch_size] __device__(
+      [desired_batch_size = target_batch_size] __device__(
         dst_buf_info const& buf) -> cuda::std::pair<std::size_t, std::size_t> {
         // Total bytes for this incoming partition
         std::size_t const bytes = buf.num_elements * static_cast<std::size_t>(buf.element_size);
@@ -1927,9 +2249,7 @@ struct contiguous_split_state {
   bool has_next() const { return !is_empty && chunk_iter_state->has_more_copies(); }
 
   std::size_t get_total_contiguous_size() const
-  {
-    return is_empty ? 0 : chunk_iter_state->total_size;
-  }
+  { return is_empty ? 0 : chunk_iter_state->total_size; }
 
   cuda::stream_ref get_stream() const { return stream; }
 
@@ -2149,7 +2469,7 @@ struct contiguous_split_state {
     auto cur_dst_buf_info = h_dst_buf_info.data();
     detail::metadata_builder mb{input.num_columns(), std::nullopt};
 
-    populate_metadata(input.begin(), input.end(), cur_dst_buf_info, mb);
+    populate_metadata(input.begin(), input.end(), cur_dst_buf_info, mb, true);
 
     return std::make_unique<std::vector<uint8_t>>(std::move(mb.build()));
   }
@@ -2192,6 +2512,7 @@ struct contiguous_split_state {
                                        partition_buf_size_and_dst_buf_info->d_dst_buf_info.data(),
                                        partition_buf_size_and_dst_buf_info->h_buf_sizes,
                                        num_partitions,
+                                       desired_batch_size,
                                        user_buffer_size,
                                        stream,
                                        temp_mr);
@@ -2347,6 +2668,198 @@ struct contiguous_split_state {
   std::vector<rmm::device_buffer>
     out_buffers;  ///< Buffers allocated for a regular `contiguous_split`
 };
+std::vector<fused_for_packed_columns> contiguous_split_fused_for(
+  table_view const& input,
+  std::vector<size_type> const& splits,
+  cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr)
+{
+  CUDF_FUNC_RANGE();
+
+  if (check_inputs(input, splits)) {
+    auto packed = cudf::detail::contiguous_split(input, splits, stream, mr);
+    std::vector<fused_for_packed_columns> result;
+    result.reserve(packed.size());
+    std::transform(
+      std::make_move_iterator(packed.begin()),
+      std::make_move_iterator(packed.end()),
+      std::back_inserter(result),
+      [](packed_table&& table) {
+        auto const logical_size = table.data.gpu_data->size();
+        return fused_for_packed_columns{
+          std::move(table.data.metadata), std::move(table.data.gpu_data), {}, logical_size};
+      });
+    return result;
+  }
+
+  auto const num_partitions = splits.size() + 1;
+  auto temp_mr              = mr;
+  size_type num_src_bufs;
+  std::size_t num_bufs;
+  std::unique_ptr<packed_partition_buf_size_and_dst_buf_info> partition_info;
+  std::tie(num_src_bufs, num_bufs, partition_info) =
+    compute_num_bufs_and_splits(input, splits, stream, temp_mr, true);
+  CUDF_EXPECTS(partition_info->d_fused_src_info.has_value(),
+               "fused FOR source descriptors are unavailable");
+
+  auto batches                             = compute_batches(static_cast<int>(num_bufs),
+                                                             partition_info->d_dst_buf_info.data(),
+                                                             partition_info->h_buf_sizes,
+                                                             num_partitions,
+                                                             fused_for_batch_size,
+                                                             0,
+                                                             stream,
+                                                             temp_mr);
+  auto const [starting_batch, num_batches] = batches->get_current_starting_index_and_buff_count();
+  CUDF_EXPECTS(starting_batch == 0, "fused FOR packing must use one iteration");
+
+  auto const num_source_buffers = static_cast<std::size_t>(num_src_bufs);
+  std::vector<std::size_t> segment_counts(num_partitions);
+  std::size_t total_segment_count = 0;
+  for (std::size_t partition = 0; partition < num_partitions; ++partition) {
+    for (std::size_t source = 0; source < num_source_buffers; ++source) {
+      auto const& info = partition_info->h_dst_buf_info[partition * num_source_buffers + source];
+      auto const bytes = info.num_elements * static_cast<std::size_t>(info.element_size);
+      auto const count =
+        bytes == 0 ? std::size_t{1} : util::div_rounding_up_safe(bytes, fused_for_batch_size);
+      CUDF_EXPECTS(count <= std::numeric_limits<std::size_t>::max() - segment_counts[partition],
+                   "fused FOR segment count overflow");
+      segment_counts[partition] += count;
+    }
+    CUDF_EXPECTS(
+      segment_counts[partition] <= std::numeric_limits<std::size_t>::max() - total_segment_count,
+      "fused FOR total segment count overflow");
+    total_segment_count += segment_counts[partition];
+  }
+  CUDF_EXPECTS(total_segment_count == num_batches,
+               "fused FOR host and device segment counts disagree");
+
+  std::vector<rmm::device_buffer> wire_buffers;
+  std::vector<std::uint64_t> initial_wire_offsets;
+  wire_buffers.reserve(num_partitions);
+  initial_wire_offsets.reserve(num_partitions);
+  for (std::size_t partition = 0; partition < num_partitions; ++partition) {
+    auto const logical_size = partition_info->h_buf_sizes[partition];
+    CUDF_EXPECTS(segment_counts[partition] <=
+                   std::numeric_limits<std::size_t>::max() / sizeof(fused_for_segment),
+                 "fused FOR descriptor size overflow");
+    auto const descriptor_size =
+      util::round_up_safe(segment_counts[partition] * sizeof(fused_for_segment), std::size_t{16});
+    CUDF_EXPECTS(descriptor_size <= std::numeric_limits<std::size_t>::max() - logical_size,
+                 "fused FOR wire capacity overflow");
+    auto const base_capacity = descriptor_size + logical_size;
+    CUDF_EXPECTS(
+      segment_counts[partition] <= (std::numeric_limits<std::size_t>::max() - base_capacity) / 15,
+      "fused FOR wire capacity overflow");
+    wire_buffers.emplace_back(base_capacity + segment_counts[partition] * 15, stream, mr);
+    initial_wire_offsets.push_back(descriptor_size);
+  }
+
+  auto pointers =
+    setup_src_and_dst_pointers(input, num_partitions, num_src_bufs, wire_buffers, stream, temp_mr);
+  auto wire_offsets = detail::make_device_uvector_async(initial_wire_offsets, stream, temp_mr);
+
+  constexpr size_type block_size = 256;
+  auto index_to_buffer =
+    [dst_buffers = pointers->d_dst_bufs, info = batches->d_batched_dst_buf_info.data()] __device__(
+      unsigned int index) { return dst_buffers[info[index].dst_buf_index]; };
+  copy_partitions_fused_for<block_size>
+    <<<num_batches, block_size, fused_for_batch_size, stream.get()>>>(
+      index_to_buffer,
+      pointers->d_src_bufs,
+      partition_info->d_fused_src_info->data(),
+      batches->d_batched_dst_buf_info.data(),
+      batches->d_batch_offsets.data(),
+      num_src_bufs,
+      wire_offsets.data());
+  CUDF_CUDA_TRY(cudaGetLastError());
+
+  auto const keys = cudf::detail::make_counting_transform_iterator(
+    0, out_to_in_index_function{batches->d_batch_offsets.begin(), static_cast<int>(num_bufs)});
+  auto values = cuda::transform_iterator(
+    batches->d_batched_dst_buf_info.begin(),
+    cuda::proclaim_return_type<size_type>(
+      [] __device__(dst_buf_info const& info) { return info.valid_count; }));
+  thrust::reduce_by_key(
+    rmm::exec_policy_nosync(stream, temp_mr),
+    keys,
+    keys + num_batches,
+    values,
+    cuda::make_discard_iterator(),
+    cuda::make_tabulate_output_iterator(set_valid_count_fn{partition_info->d_dst_buf_info.data()}));
+
+  auto host_wire_offsets = detail::make_host_vector<std::uint64_t>(num_partitions, stream);
+  detail::cuda_memcpy_async<dst_buf_info>(
+    partition_info->h_dst_buf_info, partition_info->d_dst_buf_info, stream);
+  detail::cuda_memcpy_async<std::uint64_t>(host_wire_offsets, wire_offsets, stream);
+  cudf::detail::sync_stream(stream);
+
+  std::vector<fused_for_packed_columns> result;
+  result.reserve(num_partitions);
+  auto current_info = partition_info->h_dst_buf_info.data();
+  for (std::size_t partition = 0; partition < num_partitions; ++partition) {
+    detail::metadata_builder builder{input.num_columns(), std::nullopt};
+    current_info = populate_metadata(input.begin(), input.end(), current_info, builder, false);
+
+    auto const wire_size = static_cast<std::size_t>(host_wire_offsets[partition]);
+    CUDF_EXPECTS(wire_size <= wire_buffers[partition].size(),
+                 "fused FOR wire output exceeded its allocation");
+    wire_buffers[partition].resize(wire_size, stream);
+    result.push_back(fused_for_packed_columns{
+      std::make_unique<std::vector<std::uint8_t>>(builder.build()),
+      std::make_unique<rmm::device_buffer>(std::move(wire_buffers[partition])),
+      segment_counts[partition],
+      partition_info->h_buf_sizes[partition]});
+  }
+  return result;
+}
+
+fused_for_packed_columns pack_fused_for(table_view const& input,
+                                        cuda::stream_ref stream,
+                                        rmm::device_async_resource_ref mr)
+{
+  auto result = contiguous_split_fused_for(input, {}, stream, mr);
+  if (result.empty()) {
+    return fused_for_packed_columns{
+      std::make_unique<std::vector<std::uint8_t>>(), std::make_unique<rmm::device_buffer>(), {}, 0};
+  }
+  return std::move(result.front());
+}
+
+packed_columns decode_fused_for(fused_for_packed_columns&& input,
+                                cuda::stream_ref stream,
+                                rmm::device_async_resource_ref mr)
+{
+  CUDF_FUNC_RANGE();
+  CUDF_EXPECTS(input.metadata != nullptr, "fused FOR metadata is null");
+  CUDF_EXPECTS(input.wire_data != nullptr, "fused FOR wire buffer is null");
+
+  auto const wire_size = input.wire_data->size();
+  CUDF_EXPECTS(
+    input.segment_count <= std::numeric_limits<std::size_t>::max() / sizeof(fused_for_segment),
+    "fused FOR descriptor size overflow");
+  auto const descriptor_size =
+    util::round_up_safe(input.segment_count * sizeof(fused_for_segment), std::size_t{16});
+  CUDF_EXPECTS(descriptor_size <= wire_size, "fused FOR descriptors exceed the wire buffer");
+
+  auto output = std::make_unique<rmm::device_buffer>(input.logical_data_size, stream, mr);
+  if (input.segment_count != 0) {
+    constexpr size_type block_size = 256;
+    auto const* wire               = static_cast<std::uint8_t const*>(input.wire_data->data());
+    decode_fused_for_segments<<<input.segment_count, block_size, 0, stream.get()>>>(
+      wire,
+      static_cast<std::uint8_t*>(output->data()),
+      reinterpret_cast<fused_for_segment const*>(wire),
+      wire_size,
+      input.logical_data_size);
+    CUDF_CUDA_TRY(cudaGetLastError());
+  } else {
+    CUDF_EXPECTS(input.logical_data_size == 0 && wire_size == 0,
+                 "non-empty fused FOR output has no segments");
+  }
+
+  return packed_columns{std::move(input.metadata), std::move(output)};
+}
 
 std::vector<packed_table> contiguous_split(cudf::table_view const& input,
                                            std::vector<size_type> const& splits,
@@ -2388,29 +2901,21 @@ chunked_pack::chunked_pack(cudf::table_view const& input,
 chunked_pack::~chunked_pack() = default;
 
 std::size_t chunked_pack::get_total_contiguous_size() const
-{
-  return state->get_total_contiguous_size();
-}
+{ return state->get_total_contiguous_size(); }
 
 bool chunked_pack::has_next() const { return state->has_next(); }
 
 std::size_t chunked_pack::next(cudf::device_span<uint8_t> const& user_buffer)
-{
-  return state->contiguous_split_chunk(user_buffer);
-}
+{ return state->contiguous_split_chunk(user_buffer); }
 
 std::unique_ptr<std::vector<uint8_t>> chunked_pack::build_metadata() const
-{
-  return state->build_packed_column_metadata();
-}
+{ return state->build_packed_column_metadata(); }
 
 std::unique_ptr<chunked_pack> chunked_pack::create(cudf::table_view const& input,
                                                    std::size_t user_buffer_size,
                                                    cuda::stream_ref stream,
                                                    rmm::device_async_resource_ref temp_mr)
-{
-  return std::make_unique<chunked_pack>(input, user_buffer_size, stream, temp_mr);
-}
+{ return std::make_unique<chunked_pack>(input, user_buffer_size, stream, temp_mr); }
 
 std::size_t packed_size(cudf::table_view const& input,
                         cuda::stream_ref stream,
