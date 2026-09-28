@@ -76,6 +76,7 @@ TEST_F(FusedForSplitTest, UsesAllByteAlignedWidthsAndPreservesRawColumns)
 {
   constexpr cudf::size_type rows = 10'000;
   std::vector<std::int16_t> one_byte(rows);
+  std::vector<std::int16_t> int16_raw(rows);
   std::vector<std::int32_t> two_bytes(rows);
   std::vector<std::int64_t> four_bytes(rows);
   std::vector<std::int64_t> eight_bytes(rows);
@@ -85,6 +86,7 @@ TEST_F(FusedForSplitTest, UsesAllByteAlignedWidthsAndPreservesRawColumns)
 
   for (cudf::size_type i = 0; i < rows; ++i) {
     one_byte[i]    = i % 2 == 0 ? -100 : 100;
+    int16_raw[i]   = i % 2 == 0 ? -30'000 : 30'000;
     two_bytes[i]   = i % 2 == 0 ? -30'000 : 30'000;
     four_bytes[i]  = i % 2 == 0 ? -1'000'000'000LL : 1'000'000'000LL;
     eight_bytes[i] = i % 2 == 0 ? std::numeric_limits<std::int64_t>::lowest()
@@ -95,6 +97,8 @@ TEST_F(FusedForSplitTest, UsesAllByteAlignedWidthsAndPreservesRawColumns)
   }
 
   cudf::test::fixed_width_column_wrapper<std::int16_t> byte_col(one_byte.begin(), one_byte.end());
+  cudf::test::fixed_width_column_wrapper<std::int16_t> int16_raw_col(int16_raw.begin(),
+                                                                     int16_raw.end());
   cudf::test::fixed_width_column_wrapper<std::int32_t> short_col(two_bytes.begin(),
                                                                  two_bytes.end());
   cudf::test::fixed_width_column_wrapper<std::int64_t> word_col(four_bytes.begin(),
@@ -103,7 +107,8 @@ TEST_F(FusedForSplitTest, UsesAllByteAlignedWidthsAndPreservesRawColumns)
     eight_bytes.begin(), eight_bytes.end(), valid.begin());
   cudf::test::fixed_width_column_wrapper<float> float_col(floating.begin(), floating.end());
   cudf::test::strings_column_wrapper string_col(strings.begin(), strings.end());
-  cudf::table_view input{{byte_col, short_col, word_col, raw_col, float_col, string_col}};
+  cudf::table_view input{
+    {byte_col, int16_raw_col, short_col, word_col, raw_col, float_col, string_col}};
 
   auto const stream = cudf::get_default_stream();
   auto const mr     = cudf::get_current_device_resource_ref();
@@ -115,9 +120,24 @@ TEST_F(FusedForSplitTest, UsesAllByteAlignedWidthsAndPreservesRawColumns)
       return segment.logical_width == logical && segment.wire_width == wire;
     });
   };
-  EXPECT_TRUE(has_width(2, 1));
-  EXPECT_TRUE(has_width(4, 2));
-  EXPECT_TRUE(has_width(8, 4));
+  auto const* layout        = std::getenv("CUDF_FUSED_FOR_LAYOUT");
+  auto const bitpacked_mode = layout != nullptr && std::string_view{layout} == "bitpacked";
+  if (bitpacked_mode) {
+    auto has_bits = [&descriptors](std::uint8_t logical, std::uint8_t bits) {
+      return std::any_of(descriptors.begin(), descriptors.end(), [=](auto const& segment) {
+        return segment.is_bitpacked() && segment.logical_width == logical &&
+               segment.wire_width == bits;
+      });
+    };
+    EXPECT_TRUE(has_bits(2, 8));
+    EXPECT_TRUE(has_bits(4, 16));
+    EXPECT_TRUE(has_bits(8, 31));
+  } else {
+    EXPECT_TRUE(has_width(2, 1));
+    EXPECT_TRUE(has_width(4, 2));
+    EXPECT_TRUE(has_width(8, 4));
+  }
+  EXPECT_TRUE(has_width(2, 2));
   EXPECT_TRUE(has_width(8, 8));
   EXPECT_LT(packed.wire_data->size(), packed.logical_data_size);
 
@@ -280,10 +300,10 @@ TEST_F(FusedForSplitTest, Decimal32And64PreserveScale)
   auto packed       = cudf::detail::pack_fused_for(input, stream, mr);
   auto descriptors  = copy_descriptors_to_host(packed, stream);
   EXPECT_TRUE(std::any_of(descriptors.begin(), descriptors.end(), [](auto const& segment) {
-    return segment.logical_width == 4 && segment.wire_width < segment.logical_width;
+    return segment.logical_width == 4 && segment.is_encoded();
   }));
   EXPECT_TRUE(std::any_of(descriptors.begin(), descriptors.end(), [](auto const& segment) {
-    return segment.logical_width == 8 && segment.wire_width < segment.logical_width;
+    return segment.logical_width == 8 && segment.is_encoded();
   }));
 
   auto expected = cudf::pack(input, stream, mr);

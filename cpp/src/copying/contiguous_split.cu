@@ -434,7 +434,8 @@ template <typename T>
 __device__ std::uint8_t fused_for_width(T minimum, T maximum)
 {
   using unsigned_type = cuda::std::make_unsigned_t<T>;
-  auto const range    = static_cast<unsigned_type>(maximum) - static_cast<unsigned_type>(minimum);
+  auto const range    = static_cast<unsigned_type>(static_cast<unsigned_type>(maximum) -
+                                                   static_cast<unsigned_type>(minimum));
   if (range <= cuda::std::numeric_limits<std::uint8_t>::max()) { return 1; }
   if constexpr (sizeof(T) > 2) {
     if (range <= cuda::std::numeric_limits<std::uint16_t>::max()) { return 2; }
@@ -449,7 +450,8 @@ template <typename T>
 __device__ std::uint8_t fused_for_bit_width(T minimum, T maximum)
 {
   using unsigned_type = cuda::std::make_unsigned_t<T>;
-  auto const range    = static_cast<unsigned_type>(maximum) - static_cast<unsigned_type>(minimum);
+  auto const range    = static_cast<unsigned_type>(static_cast<unsigned_type>(maximum) -
+                                                   static_cast<unsigned_type>(minimum));
   if (range == 0) { return 0; }
   if constexpr (sizeof(T) <= sizeof(unsigned int)) {
     return static_cast<std::uint8_t>(32 - __clz(static_cast<unsigned int>(range)));
