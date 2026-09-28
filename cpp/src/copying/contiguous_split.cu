@@ -55,13 +55,16 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cstddef>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 #include <numeric>
 #include <optional>
 #include <stdexcept>
 #include <tuple>
+#include <string_view>
 #include <type_traits>
 
 namespace cudf {
@@ -77,7 +80,26 @@ static constexpr std::size_t split_align = 64;
 static constexpr std::size_t desired_batch_size = 1 * 1024 * 1024;
 // Fused FOR keeps one numeric tile in shared memory so each source value is
 // read only once while the block computes its base, width, and encoded bytes.
-static constexpr std::size_t fused_for_batch_size = 8 * 1024;
+// The environment override is benchmark-only. The accepted implementation
+// remains the 8 KiB default when it is absent.
+std::size_t fused_for_tile_bytes()
+{
+  static auto const tile_bytes = [] {
+    constexpr std::size_t default_tile_bytes = 8 * 1024;
+    auto const* encoded                      = std::getenv("CUDF_FUSED_FOR_TILE_BYTES");
+    if (encoded == nullptr) { return default_tile_bytes; }
+
+    std::string_view const text{encoded};
+    std::size_t parsed{};
+    auto const [end, error] = std::from_chars(text.data(), text.data() + text.size(), parsed);
+    CUDF_EXPECTS(error == std::errc{} && end == text.data() + text.size(),
+                 "CUDF_FUSED_FOR_TILE_BYTES must be an integer");
+    CUDF_EXPECTS(parsed >= 1024 && parsed <= 32 * 1024 && (parsed & (parsed - 1)) == 0,
+                 "CUDF_FUSED_FOR_TILE_BYTES must be a power of two from 1024 through 32768");
+    return parsed;
+  }();
+  return tile_bytes;
+}
 
 /**
  * @brief Struct which contains information on a source buffer.
@@ -2704,11 +2726,12 @@ std::vector<fused_for_packed_columns> contiguous_split_fused_for(
   CUDF_EXPECTS(partition_info->d_fused_src_info.has_value(),
                "fused FOR source descriptors are unavailable");
 
+  auto const tile_bytes                    = fused_for_tile_bytes();
   auto batches                             = compute_batches(static_cast<int>(num_bufs),
                                                              partition_info->d_dst_buf_info.data(),
                                                              partition_info->h_buf_sizes,
                                                              num_partitions,
-                                                             fused_for_batch_size,
+                                                             tile_bytes,
                                                              0,
                                                              stream,
                                                              temp_mr);
@@ -2723,7 +2746,7 @@ std::vector<fused_for_packed_columns> contiguous_split_fused_for(
       auto const& info = partition_info->h_dst_buf_info[partition * num_source_buffers + source];
       auto const bytes = info.num_elements * static_cast<std::size_t>(info.element_size);
       auto const count =
-        bytes == 0 ? std::size_t{1} : util::div_rounding_up_safe(bytes, fused_for_batch_size);
+        bytes == 0 ? std::size_t{1} : util::div_rounding_up_safe(bytes, tile_bytes);
       CUDF_EXPECTS(count <= std::numeric_limits<std::size_t>::max() - segment_counts[partition],
                    "fused FOR segment count overflow");
       segment_counts[partition] += count;
@@ -2765,15 +2788,14 @@ std::vector<fused_for_packed_columns> contiguous_split_fused_for(
   auto index_to_buffer =
     [dst_buffers = pointers->d_dst_bufs, info = batches->d_batched_dst_buf_info.data()] __device__(
       unsigned int index) { return dst_buffers[info[index].dst_buf_index]; };
-  copy_partitions_fused_for<block_size>
-    <<<num_batches, block_size, fused_for_batch_size, stream.get()>>>(
-      index_to_buffer,
-      pointers->d_src_bufs,
-      partition_info->d_fused_src_info->data(),
-      batches->d_batched_dst_buf_info.data(),
-      batches->d_batch_offsets.data(),
-      num_src_bufs,
-      wire_offsets.data());
+  copy_partitions_fused_for<block_size><<<num_batches, block_size, tile_bytes, stream.get()>>>(
+    index_to_buffer,
+    pointers->d_src_bufs,
+    partition_info->d_fused_src_info->data(),
+    batches->d_batched_dst_buf_info.data(),
+    batches->d_batch_offsets.data(),
+    num_src_bufs,
+    wire_offsets.data());
   CUDF_CUDA_TRY(cudaGetLastError());
 
   auto const keys = cudf::detail::make_counting_transform_iterator(
