@@ -101,6 +101,22 @@ std::size_t fused_for_tile_bytes()
   return tile_bytes;
 }
 
+enum class fused_for_layout { byte_aligned, bitpacked };
+
+fused_for_layout fused_for_wire_layout()
+{
+  static auto const layout = [] {
+    auto const* encoded = std::getenv("CUDF_FUSED_FOR_LAYOUT");
+    if (encoded == nullptr) { return fused_for_layout::byte_aligned; }
+
+    std::string_view const text{encoded};
+    CUDF_EXPECTS(text == "byte-aligned" || text == "bitpacked",
+                 "CUDF_FUSED_FOR_LAYOUT must be byte-aligned or bitpacked");
+    return text == "bitpacked" ? fused_for_layout::bitpacked : fused_for_layout::byte_aligned;
+  }();
+  return layout;
+}
+
 /**
  * @brief Struct which contains information on a source buffer.
  *
@@ -429,7 +445,20 @@ __device__ std::uint8_t fused_for_width(T minimum, T maximum)
   return sizeof(T);
 }
 
-template <typename T, int block_size>
+template <typename T>
+__device__ std::uint8_t fused_for_bit_width(T minimum, T maximum)
+{
+  using unsigned_type = cuda::std::make_unsigned_t<T>;
+  auto const range    = static_cast<unsigned_type>(maximum) - static_cast<unsigned_type>(minimum);
+  if (range == 0) { return 0; }
+  if constexpr (sizeof(T) <= sizeof(unsigned int)) {
+    return static_cast<std::uint8_t>(32 - __clz(static_cast<unsigned int>(range)));
+  } else {
+    return static_cast<std::uint8_t>(64 - __clzll(static_cast<unsigned long long>(range)));
+  }
+}
+
+template <typename T, int block_size, bool bitpacked>
 __device__ void encode_fused_for_tile(uint8_t* wire_buffer,
                                       std::uint64_t* wire_offsets,
                                       detail::fused_for_segment* segments,
@@ -462,11 +491,21 @@ __device__ void encode_fused_for_tile(uint8_t* wire_buffer,
 
   __shared__ T base;
   __shared__ std::uint8_t width;
+  __shared__ std::uint16_t flags;
   __shared__ std::size_t wire_offset;
   if (threadIdx.x == 0) {
-    base             = minimum;
-    width            = fused_for_width(minimum, maximum);
-    auto const bytes = count * static_cast<std::size_t>(width);
+    base = minimum;
+    if constexpr (bitpacked) {
+      auto const bits = fused_for_bit_width(minimum, maximum);
+      flags           = bits < sizeof(T) * 8 ? detail::fused_for_bitpacked : 0;
+      width = flags == detail::fused_for_bitpacked ? bits : static_cast<std::uint8_t>(sizeof(T));
+    } else {
+      flags = 0;
+      width = fused_for_width(minimum, maximum);
+    }
+    auto const bytes = flags == detail::fused_for_bitpacked
+                         ? (count * static_cast<std::size_t>(width) + 7) / 8
+                         : count * static_cast<std::size_t>(width);
     wire_offset      = reserve_fused_for_bytes(wire_offsets, destination.dst_buf_index, bytes);
 
     using unsigned_type = cuda::std::make_unsigned_t<T>;
@@ -477,11 +516,40 @@ __device__ void encode_fused_for_tile(uint8_t* wire_buffer,
                                 static_cast<std::uint32_t>(count),
                                 static_cast<std::uint8_t>(sizeof(T)),
                                 width,
-                                0};
+                                flags};
   }
   __syncthreads();
 
   using unsigned_type = cuda::std::make_unsigned_t<T>;
+  if constexpr (bitpacked) {
+    if (flags == detail::fused_for_bitpacked) {
+      if (width == 0) { return; }
+      auto* const output    = reinterpret_cast<std::uint32_t*>(wire_buffer + wire_offset);
+      auto const total_bits = count * static_cast<std::size_t>(width);
+      auto const word_count = (total_bits + 31) / 32;
+      for (std::size_t word = threadIdx.x; word < word_count; word += blockDim.x) {
+        auto const first_bit   = word * 32;
+        auto element           = first_bit / width;
+        auto source_bit        = first_bit % width;
+        std::uint32_t packed   = 0;
+        std::size_t target_bit = 0;
+        while (target_bit < 32 && element < count) {
+          auto const offset =
+            static_cast<unsigned_type>(values[element]) - static_cast<unsigned_type>(base);
+          auto const available = static_cast<std::size_t>(width) - source_bit;
+          auto const take      = cuda::std::min(std::size_t{32} - target_bit, available);
+          auto const mask = take == 32 ? std::uint64_t{0xffffffff} : (std::uint64_t{1} << take) - 1;
+          packed |= static_cast<std::uint32_t>((offset >> source_bit) & mask) << target_bit;
+          target_bit += take;
+          ++element;
+          source_bit = 0;
+        }
+        output[word] = packed;
+      }
+      return;
+    }
+  }
+
   for (std::size_t i = threadIdx.x; i < count; i += blockDim.x) {
     if (width == sizeof(T)) {
       reinterpret_cast<T*>(wire_buffer + wire_offset)[i] = values[i];
@@ -502,7 +570,7 @@ __device__ void encode_fused_for_tile(uint8_t* wire_buffer,
   }
 }
 
-template <int block_size, typename IndexToDstBuf>
+template <int block_size, bool bitpacked, typename IndexToDstBuf>
 CUDF_KERNEL void copy_partitions_fused_for(IndexToDstBuf index_to_buffer,
                                            uint8_t const** src_bufs,
                                            src_buf_info const* src_info,
@@ -523,39 +591,41 @@ CUDF_KERNEL void copy_partitions_fused_for(IndexToDstBuf index_to_buffer,
     auto const* src = src_bufs[src_buf_index];
     switch (source.type) {
       case type_id::INT16:
-        encode_fused_for_tile<int16_t, block_size>(wire_buffer,
-                                                   wire_offsets,
-                                                   segments,
-                                                   segment_index,
-                                                   reinterpret_cast<int16_t const*>(src),
-                                                   destination);
+        encode_fused_for_tile<int16_t, block_size, bitpacked>(wire_buffer,
+                                                              wire_offsets,
+                                                              segments,
+                                                              segment_index,
+                                                              reinterpret_cast<int16_t const*>(src),
+                                                              destination);
         return;
       case type_id::UINT16:
-        encode_fused_for_tile<uint16_t, block_size>(wire_buffer,
-                                                    wire_offsets,
-                                                    segments,
-                                                    segment_index,
-                                                    reinterpret_cast<uint16_t const*>(src),
-                                                    destination);
+        encode_fused_for_tile<uint16_t, block_size, bitpacked>(
+          wire_buffer,
+          wire_offsets,
+          segments,
+          segment_index,
+          reinterpret_cast<uint16_t const*>(src),
+          destination);
         return;
       case type_id::INT32:
       case type_id::TIMESTAMP_DAYS:
       case type_id::DURATION_DAYS:
       case type_id::DECIMAL32:
-        encode_fused_for_tile<int32_t, block_size>(wire_buffer,
-                                                   wire_offsets,
-                                                   segments,
-                                                   segment_index,
-                                                   reinterpret_cast<int32_t const*>(src),
-                                                   destination);
+        encode_fused_for_tile<int32_t, block_size, bitpacked>(wire_buffer,
+                                                              wire_offsets,
+                                                              segments,
+                                                              segment_index,
+                                                              reinterpret_cast<int32_t const*>(src),
+                                                              destination);
         return;
       case type_id::UINT32:
-        encode_fused_for_tile<uint32_t, block_size>(wire_buffer,
-                                                    wire_offsets,
-                                                    segments,
-                                                    segment_index,
-                                                    reinterpret_cast<uint32_t const*>(src),
-                                                    destination);
+        encode_fused_for_tile<uint32_t, block_size, bitpacked>(
+          wire_buffer,
+          wire_offsets,
+          segments,
+          segment_index,
+          reinterpret_cast<uint32_t const*>(src),
+          destination);
         return;
       case type_id::INT64:
       case type_id::TIMESTAMP_SECONDS:
@@ -567,20 +637,21 @@ CUDF_KERNEL void copy_partitions_fused_for(IndexToDstBuf index_to_buffer,
       case type_id::DURATION_MICROSECONDS:
       case type_id::DURATION_NANOSECONDS:
       case type_id::DECIMAL64:
-        encode_fused_for_tile<int64_t, block_size>(wire_buffer,
-                                                   wire_offsets,
-                                                   segments,
-                                                   segment_index,
-                                                   reinterpret_cast<int64_t const*>(src),
-                                                   destination);
+        encode_fused_for_tile<int64_t, block_size, bitpacked>(wire_buffer,
+                                                              wire_offsets,
+                                                              segments,
+                                                              segment_index,
+                                                              reinterpret_cast<int64_t const*>(src),
+                                                              destination);
         return;
       case type_id::UINT64:
-        encode_fused_for_tile<uint64_t, block_size>(wire_buffer,
-                                                    wire_offsets,
-                                                    segments,
-                                                    segment_index,
-                                                    reinterpret_cast<uint64_t const*>(src),
-                                                    destination);
+        encode_fused_for_tile<uint64_t, block_size, bitpacked>(
+          wire_buffer,
+          wire_offsets,
+          segments,
+          segment_index,
+          reinterpret_cast<uint64_t const*>(src),
+          destination);
         return;
       default: break;
     }
@@ -625,6 +696,38 @@ __device__ void decode_fused_for_values(uint8_t const* wire,
   }
 }
 
+template <typename Logical>
+__device__ void decode_fused_for_bitpacked_values(uint8_t const* wire,
+                                                  uint8_t* logical,
+                                                  detail::fused_for_segment const& segment)
+{
+  auto const* words = reinterpret_cast<std::uint32_t const*>(wire + segment.wire_offset);
+  auto* values      = reinterpret_cast<Logical*>(logical + segment.logical_offset);
+  auto const base   = static_cast<Logical>(segment.reference);
+  auto const bits   = static_cast<std::size_t>(segment.wire_width);
+  auto const mask   = bits == 0 ? std::uint64_t{0} : (std::uint64_t{1} << bits) - 1;
+
+  for (std::size_t i = threadIdx.x; i < segment.element_count; i += blockDim.x) {
+    std::uint64_t offset = 0;
+    if (bits != 0) {
+      auto const bit_position = i * bits;
+      auto const word         = bit_position / 32;
+      auto const word_bit     = bit_position % 32;
+      offset                  = static_cast<std::uint64_t>(words[word]) >> word_bit;
+      auto available          = std::size_t{32} - word_bit;
+      if (bits > available) {
+        offset |= static_cast<std::uint64_t>(words[word + 1]) << available;
+        available += 32;
+        if (bits > available) {
+          offset |= static_cast<std::uint64_t>(words[word + 2]) << available;
+        }
+      }
+      offset &= mask;
+    }
+    values[i] = base + static_cast<Logical>(offset);
+  }
+}
+
 CUDF_KERNEL void decode_fused_for_segments(uint8_t const* wire,
                                            uint8_t* logical,
                                            detail::fused_for_segment const* segments,
@@ -636,21 +739,41 @@ CUDF_KERNEL void decode_fused_for_segments(uint8_t const* wire,
   auto const wire_width    = static_cast<std::size_t>(segment.wire_width);
   auto const valid_logical_width =
     logical_width == 1 || logical_width == 2 || logical_width == 4 || logical_width == 8;
-  auto const valid_wire_width =
-    wire_width == 1 || wire_width == 2 || wire_width == 4 || wire_width == 8;
-  if (!valid_logical_width || !valid_wire_width || wire_width > logical_width) { return; }
+  auto const bitpacked = segment.flags == detail::fused_for_bitpacked;
+  if (!valid_logical_width || (segment.flags != 0 && !bitpacked)) { return; }
+
+  if (bitpacked) {
+    if (logical_width == 1 || wire_width >= logical_width * 8) { return; }
+  } else {
+    auto const valid_wire_width =
+      wire_width == 1 || wire_width == 2 || wire_width == 4 || wire_width == 8;
+    if (!valid_wire_width || wire_width > logical_width) { return; }
+  }
 
   auto const logical_bytes = static_cast<std::size_t>(segment.element_count) * logical_width;
-  auto const wire_bytes    = static_cast<std::size_t>(segment.element_count) * wire_width;
+  auto const wire_bytes = bitpacked
+                            ? (static_cast<std::size_t>(segment.element_count) * wire_width + 7) / 8
+                            : static_cast<std::size_t>(segment.element_count) * wire_width;
   if (segment.logical_offset > logical_size ||
       logical_bytes > logical_size - segment.logical_offset || segment.wire_offset > wire_size ||
       wire_bytes > wire_size - segment.wire_offset) {
     return;
   }
 
-  if (segment.wire_width == segment.logical_width) {
+  if (!bitpacked && segment.wire_width == segment.logical_width) {
     for (std::size_t i = threadIdx.x; i < logical_bytes; i += blockDim.x) {
       logical[segment.logical_offset + i] = wire[segment.wire_offset + i];
+    }
+    return;
+  }
+
+  if (bitpacked) {
+    if (segment.logical_width == 2) {
+      decode_fused_for_bitpacked_values<std::uint16_t>(wire, logical, segment);
+    } else if (segment.logical_width == 4) {
+      decode_fused_for_bitpacked_values<std::uint32_t>(wire, logical, segment);
+    } else if (segment.logical_width == 8) {
+      decode_fused_for_bitpacked_values<std::uint64_t>(wire, logical, segment);
     }
     return;
   }
@@ -2727,6 +2850,7 @@ std::vector<fused_for_packed_columns> contiguous_split_fused_for(
                "fused FOR source descriptors are unavailable");
 
   auto const tile_bytes                    = fused_for_tile_bytes();
+  auto const wire_layout                   = fused_for_wire_layout();
   auto batches                             = compute_batches(static_cast<int>(num_bufs),
                                                              partition_info->d_dst_buf_info.data(),
                                                              partition_info->h_buf_sizes,
@@ -2788,14 +2912,27 @@ std::vector<fused_for_packed_columns> contiguous_split_fused_for(
   auto index_to_buffer =
     [dst_buffers = pointers->d_dst_bufs, info = batches->d_batched_dst_buf_info.data()] __device__(
       unsigned int index) { return dst_buffers[info[index].dst_buf_index]; };
-  copy_partitions_fused_for<block_size><<<num_batches, block_size, tile_bytes, stream.get()>>>(
-    index_to_buffer,
-    pointers->d_src_bufs,
-    partition_info->d_fused_src_info->data(),
-    batches->d_batched_dst_buf_info.data(),
-    batches->d_batch_offsets.data(),
-    num_src_bufs,
-    wire_offsets.data());
+  if (wire_layout == fused_for_layout::bitpacked) {
+    copy_partitions_fused_for<block_size, true>
+      <<<num_batches, block_size, tile_bytes, stream.get()>>>(
+        index_to_buffer,
+        pointers->d_src_bufs,
+        partition_info->d_fused_src_info->data(),
+        batches->d_batched_dst_buf_info.data(),
+        batches->d_batch_offsets.data(),
+        num_src_bufs,
+        wire_offsets.data());
+  } else {
+    copy_partitions_fused_for<block_size, false>
+      <<<num_batches, block_size, tile_bytes, stream.get()>>>(
+        index_to_buffer,
+        pointers->d_src_bufs,
+        partition_info->d_fused_src_info->data(),
+        batches->d_batched_dst_buf_info.data(),
+        batches->d_batch_offsets.data(),
+        num_src_bufs,
+        wire_offsets.data());
+  }
   CUDF_CUDA_TRY(cudaGetLastError());
 
   auto const keys = cudf::detail::make_counting_transform_iterator(

@@ -26,11 +26,15 @@ namespace cudf::detail {
  * @brief Describes one independently encoded segment of a fused
  * frame-of-reference payload.
  *
- * If `wire_width < logical_width`, the segment contains unsigned offsets and
- * each logical value is reconstructed as `reference + offset`, modulo the
- * logical width. Otherwise the segment is a raw byte copy and `reference` is
- * zero. All offsets are byte offsets.
+ * Byte-aligned segments store `wire_width` bytes per unsigned offset.
+ * Bitpacked segments store `wire_width` bits per unsigned offset and set
+ * `fused_for_bitpacked`. Each logical value is reconstructed as
+ * `reference + offset`, modulo the logical width. Raw segments use equal
+ * logical and wire byte widths, a zero reference, and no flags. All offsets
+ * are byte offsets.
  */
+inline constexpr std::uint16_t fused_for_bitpacked = 1;
+
 struct alignas(8) fused_for_segment {
   std::uint64_t wire_offset;
   std::uint64_t logical_offset;
@@ -38,9 +42,10 @@ struct alignas(8) fused_for_segment {
   std::uint32_t element_count;
   std::uint8_t logical_width;
   std::uint8_t wire_width;
-  std::uint16_t reserved;
+  std::uint16_t flags;
 
-  [[nodiscard]] bool is_encoded() const { return wire_width < logical_width; }
+  [[nodiscard]] bool is_bitpacked() const { return (flags & fused_for_bitpacked) != 0; }
+  [[nodiscard]] bool is_encoded() const { return is_bitpacked() || wire_width < logical_width; }
 };
 static_assert(sizeof(fused_for_segment) == 32);
 

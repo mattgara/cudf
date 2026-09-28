@@ -19,8 +19,10 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <string>
+#include <string_view>
 #include <vector>
 
 struct FusedForSplitTest : public cudf::test::BaseFixture {};
@@ -118,6 +120,62 @@ TEST_F(FusedForSplitTest, UsesAllByteAlignedWidthsAndPreservesRawColumns)
   EXPECT_TRUE(has_width(8, 4));
   EXPECT_TRUE(has_width(8, 8));
   EXPECT_LT(packed.wire_data->size(), packed.logical_data_size);
+
+  auto expected = cudf::pack(input, stream, mr);
+  auto decoded  = cudf::detail::decode_fused_for(std::move(packed), stream, mr);
+  expect_packed_equivalent(expected, decoded, stream);
+}
+
+TEST_F(FusedForSplitTest, BitpackedNonByteWidthsRoundTrip)
+{
+  auto const* layout = std::getenv("CUDF_FUSED_FOR_LAYOUT");
+  if (layout == nullptr || std::string_view{layout} != "bitpacked") {
+    GTEST_SKIP() << "Run this test in a fresh process with CUDF_FUSED_FOR_LAYOUT=bitpacked";
+  }
+
+  constexpr cudf::size_type rows = 10'000;
+  std::vector<std::int16_t> five_bit(rows);
+  std::vector<std::int32_t> seventeen_bit(rows);
+  std::vector<std::int64_t> forty_bit(rows);
+  std::vector<std::int64_t> constants(rows, -8'000'000'000'000LL);
+  std::vector<std::int64_t> raw(rows);
+  for (cudf::size_type i = 0; i < rows; ++i) {
+    five_bit[i]      = i % 2 == 0 ? -10 : 21;
+    seventeen_bit[i] = i % 2 == 0 ? -50'000 : 50'000;
+    forty_bit[i]     = i % 2 == 0 ? -2'000'000'000'000LL : -900'488'372'225LL;
+    raw[i]           = i % 2 == 0 ? std::numeric_limits<std::int64_t>::lowest()
+                                  : std::numeric_limits<std::int64_t>::max();
+  }
+
+  cudf::test::fixed_width_column_wrapper<std::int16_t> five_bit_col(five_bit.begin(),
+                                                                    five_bit.end());
+  cudf::test::fixed_width_column_wrapper<std::int32_t> seventeen_bit_col(seventeen_bit.begin(),
+                                                                         seventeen_bit.end());
+  cudf::test::fixed_width_column_wrapper<std::int64_t> forty_bit_col(forty_bit.begin(),
+                                                                     forty_bit.end());
+  cudf::test::fixed_width_column_wrapper<std::int64_t> constant_col(constants.begin(),
+                                                                    constants.end());
+  cudf::test::fixed_width_column_wrapper<std::int64_t> raw_col(raw.begin(), raw.end());
+  cudf::table_view input{{five_bit_col, seventeen_bit_col, forty_bit_col, constant_col, raw_col}};
+
+  auto const stream = cudf::get_default_stream();
+  auto const mr     = cudf::get_current_device_resource_ref();
+  auto packed       = cudf::detail::pack_fused_for(input, stream, mr);
+  auto descriptors  = copy_descriptors_to_host(packed, stream);
+
+  auto has_bits = [&descriptors](std::uint8_t logical_width, std::uint8_t bits) {
+    return std::any_of(descriptors.begin(), descriptors.end(), [=](auto const& segment) {
+      return segment.is_bitpacked() && segment.logical_width == logical_width &&
+             segment.wire_width == bits;
+    });
+  };
+  EXPECT_TRUE(has_bits(2, 5));
+  EXPECT_TRUE(has_bits(4, 17));
+  EXPECT_TRUE(has_bits(8, 40));
+  EXPECT_TRUE(has_bits(8, 0));
+  EXPECT_TRUE(std::any_of(descriptors.begin(), descriptors.end(), [](auto const& segment) {
+    return !segment.is_bitpacked() && segment.logical_width == 8 && segment.wire_width == 8;
+  }));
 
   auto expected = cudf::pack(input, stream, mr);
   auto decoded  = cudf::detail::decode_fused_for(std::move(packed), stream, mr);
