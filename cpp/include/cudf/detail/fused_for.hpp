@@ -67,6 +67,16 @@ struct fused_for_packed_columns {
   std::size_t logical_data_size;
 };
 
+enum class fused_for_layout : std::uint8_t { byte_aligned, bitpacked };
+
+/**
+ * @brief Controls the physical representation produced by fused FOR packing.
+ */
+struct fused_for_options {
+  std::size_t tile_bytes{8 * 1024};
+  fused_for_layout layout{fused_for_layout::byte_aligned};
+};
+
 /**
  * @brief Split and pack a table while applying tiled frame-of-reference
  * narrowing to eligible top-level numeric columns.
@@ -88,14 +98,16 @@ CUDF_EXPORT std::vector<fused_for_packed_columns> contiguous_split_fused_for(
   table_view const& input,
   std::vector<size_type> const& splits,
   cuda::stream_ref stream,
-  rmm::device_async_resource_ref mr);
+  rmm::device_async_resource_ref mr,
+  fused_for_options const& options = {});
 
 /**
  * @brief Pack a table with the same fused frame-of-reference transform.
  */
 CUDF_EXPORT fused_for_packed_columns pack_fused_for(table_view const& input,
                                                     cuda::stream_ref stream,
-                                                    rmm::device_async_resource_ref mr);
+                                                    rmm::device_async_resource_ref mr,
+                                                    fused_for_options const& options = {});
 
 /**
  * @brief Reconstruct ordinary packed columns from a fused

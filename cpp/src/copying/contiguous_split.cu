@@ -58,7 +58,6 @@
 #include <charconv>
 #include <cstddef>
 #include <cstring>
-#include <cstdlib>
 #include <limits>
 #include <numeric>
 #include <optional>
@@ -78,45 +77,6 @@ static constexpr std::size_t split_align = 64;
 // The number of `desired_batch_size` batches equals the number of CUDA blocks
 // that will be used for the main kernel launch (`copy_partitions`).
 static constexpr std::size_t desired_batch_size = 1 * 1024 * 1024;
-// Fused FOR keeps one numeric tile in shared memory so each source value is
-// read only once while the block computes its base, width, and encoded bytes.
-// The environment override is benchmark-only. The accepted implementation
-// remains the 8 KiB default when it is absent.
-std::size_t fused_for_tile_bytes()
-{
-  static auto const tile_bytes = [] {
-    constexpr std::size_t default_tile_bytes = 8 * 1024;
-    auto const* encoded                      = std::getenv("CUDF_FUSED_FOR_TILE_BYTES");
-    if (encoded == nullptr) { return default_tile_bytes; }
-
-    std::string_view const text{encoded};
-    std::size_t parsed{};
-    auto const [end, error] = std::from_chars(text.data(), text.data() + text.size(), parsed);
-    CUDF_EXPECTS(error == std::errc{} && end == text.data() + text.size(),
-                 "CUDF_FUSED_FOR_TILE_BYTES must be an integer");
-    CUDF_EXPECTS(parsed >= 1024 && parsed <= 32 * 1024 && (parsed & (parsed - 1)) == 0,
-                 "CUDF_FUSED_FOR_TILE_BYTES must be a power of two from 1024 through 32768");
-    return parsed;
-  }();
-  return tile_bytes;
-}
-
-enum class fused_for_layout { byte_aligned, bitpacked };
-
-fused_for_layout fused_for_wire_layout()
-{
-  static auto const layout = [] {
-    auto const* encoded = std::getenv("CUDF_FUSED_FOR_LAYOUT");
-    if (encoded == nullptr) { return fused_for_layout::byte_aligned; }
-
-    std::string_view const text{encoded};
-    CUDF_EXPECTS(text == "byte-aligned" || text == "bitpacked",
-                 "CUDF_FUSED_FOR_LAYOUT must be byte-aligned or bitpacked");
-    return text == "bitpacked" ? fused_for_layout::bitpacked : fused_for_layout::byte_aligned;
-  }();
-  return layout;
-}
-
 /**
  * @brief Struct which contains information on a source buffer.
  *
@@ -2821,9 +2781,14 @@ std::vector<fused_for_packed_columns> contiguous_split_fused_for(
   table_view const& input,
   std::vector<size_type> const& splits,
   cuda::stream_ref stream,
-  rmm::device_async_resource_ref mr)
+  rmm::device_async_resource_ref mr,
+  fused_for_options const& options)
 {
   CUDF_FUNC_RANGE();
+
+  CUDF_EXPECTS(options.tile_bytes >= 1024 && options.tile_bytes <= 32 * 1024 &&
+                 (options.tile_bytes & (options.tile_bytes - 1)) == 0,
+               "Fused FOR tile size must be a power of two from 1024 through 32768");
 
   if (check_inputs(input, splits)) {
     auto packed = cudf::detail::contiguous_split(input, splits, stream, mr);
@@ -2851,8 +2816,7 @@ std::vector<fused_for_packed_columns> contiguous_split_fused_for(
   CUDF_EXPECTS(partition_info->d_fused_src_info.has_value(),
                "fused FOR source descriptors are unavailable");
 
-  auto const tile_bytes                    = fused_for_tile_bytes();
-  auto const wire_layout                   = fused_for_wire_layout();
+  auto const tile_bytes                    = options.tile_bytes;
   auto batches                             = compute_batches(static_cast<int>(num_bufs),
                                                              partition_info->d_dst_buf_info.data(),
                                                              partition_info->h_buf_sizes,
@@ -2914,7 +2878,7 @@ std::vector<fused_for_packed_columns> contiguous_split_fused_for(
   auto index_to_buffer =
     [dst_buffers = pointers->d_dst_bufs, info = batches->d_batched_dst_buf_info.data()] __device__(
       unsigned int index) { return dst_buffers[info[index].dst_buf_index]; };
-  if (wire_layout == fused_for_layout::bitpacked) {
+  if (options.layout == fused_for_layout::bitpacked) {
     copy_partitions_fused_for<block_size, true>
       <<<num_batches, block_size, tile_bytes, stream.get()>>>(
         index_to_buffer,
@@ -2979,9 +2943,10 @@ std::vector<fused_for_packed_columns> contiguous_split_fused_for(
 
 fused_for_packed_columns pack_fused_for(table_view const& input,
                                         cuda::stream_ref stream,
-                                        rmm::device_async_resource_ref mr)
+                                        rmm::device_async_resource_ref mr,
+                                        fused_for_options const& options)
 {
-  auto result = contiguous_split_fused_for(input, {}, stream, mr);
+  auto result = contiguous_split_fused_for(input, {}, stream, mr, options);
   if (result.empty()) {
     return fused_for_packed_columns{
       std::make_unique<std::vector<std::uint8_t>>(), std::make_unique<rmm::device_buffer>(), {}, 0};

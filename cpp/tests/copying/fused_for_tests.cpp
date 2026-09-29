@@ -19,10 +19,8 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <cstdlib>
 #include <limits>
 #include <string>
-#include <string_view>
 #include <vector>
 
 struct FusedForSplitTest : public cudf::test::BaseFixture {};
@@ -113,30 +111,16 @@ TEST_F(FusedForSplitTest, UsesAllByteAlignedWidthsAndPreservesRawColumns)
   auto const stream = cudf::get_default_stream();
   auto const mr     = cudf::get_current_device_resource_ref();
   auto packed       = cudf::detail::pack_fused_for(input, stream, mr);
-  auto descriptors  = copy_descriptors_to_host(packed, stream);
+  auto descriptors = copy_descriptors_to_host(packed, stream);
 
   auto has_width = [&descriptors](std::uint8_t logical, std::uint8_t wire) {
     return std::any_of(descriptors.begin(), descriptors.end(), [=](auto const& segment) {
       return segment.logical_width == logical && segment.wire_width == wire;
     });
   };
-  auto const* layout        = std::getenv("CUDF_FUSED_FOR_LAYOUT");
-  auto const bitpacked_mode = layout != nullptr && std::string_view{layout} == "bitpacked";
-  if (bitpacked_mode) {
-    auto has_bits = [&descriptors](std::uint8_t logical, std::uint8_t bits) {
-      return std::any_of(descriptors.begin(), descriptors.end(), [=](auto const& segment) {
-        return segment.is_bitpacked() && segment.logical_width == logical &&
-               segment.wire_width == bits;
-      });
-    };
-    EXPECT_TRUE(has_bits(2, 8));
-    EXPECT_TRUE(has_bits(4, 16));
-    EXPECT_TRUE(has_bits(8, 31));
-  } else {
-    EXPECT_TRUE(has_width(2, 1));
-    EXPECT_TRUE(has_width(4, 2));
-    EXPECT_TRUE(has_width(8, 4));
-  }
+  EXPECT_TRUE(has_width(2, 1));
+  EXPECT_TRUE(has_width(4, 2));
+  EXPECT_TRUE(has_width(8, 4));
   EXPECT_TRUE(has_width(2, 2));
   EXPECT_TRUE(has_width(8, 8));
   EXPECT_LT(packed.wire_data->size(), packed.logical_data_size);
@@ -148,11 +132,6 @@ TEST_F(FusedForSplitTest, UsesAllByteAlignedWidthsAndPreservesRawColumns)
 
 TEST_F(FusedForSplitTest, BitpackedNonByteWidthsRoundTrip)
 {
-  auto const* layout = std::getenv("CUDF_FUSED_FOR_LAYOUT");
-  if (layout == nullptr || std::string_view{layout} != "bitpacked") {
-    GTEST_SKIP() << "Run this test in a fresh process with CUDF_FUSED_FOR_LAYOUT=bitpacked";
-  }
-
   constexpr cudf::size_type rows = 10'000;
   std::vector<std::int16_t> five_bit(rows);
   std::vector<std::int32_t> seventeen_bit(rows);
@@ -180,7 +159,11 @@ TEST_F(FusedForSplitTest, BitpackedNonByteWidthsRoundTrip)
 
   auto const stream = cudf::get_default_stream();
   auto const mr     = cudf::get_current_device_resource_ref();
-  auto packed       = cudf::detail::pack_fused_for(input, stream, mr);
+  auto packed       = cudf::detail::pack_fused_for(
+    input,
+    stream,
+    mr,
+    cudf::detail::fused_for_options{32 * 1024, cudf::detail::fused_for_layout::bitpacked});
   auto descriptors  = copy_descriptors_to_host(packed, stream);
 
   auto has_bits = [&descriptors](std::uint8_t logical_width, std::uint8_t bits) {
