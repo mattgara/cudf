@@ -221,9 +221,11 @@ TEST_F(FusedForSplitTest, RawSegmentsReserveWireSpaceOncePerTile)
 
 TEST_F(FusedForSplitTest, NonDefaultStreamPreservesAsyncDecodeLifetime)
 {
-  rmm::cuda_stream stream;
-  auto const stream_view = stream.view();
-  auto const mr          = cudf::get_current_device_resource_ref();
+  rmm::cuda_stream producer_stream;
+  rmm::cuda_stream consumer_stream;
+  auto const producer_stream_view = producer_stream.view();
+  auto const consumer_stream_view = consumer_stream.view();
+  auto const mr                   = cudf::get_current_device_resource_ref();
 
   constexpr cudf::size_type rows = 16'384;
   std::vector<std::int64_t> values(rows);
@@ -233,14 +235,15 @@ TEST_F(FusedForSplitTest, NonDefaultStreamPreservesAsyncDecodeLifetime)
 
   cudf::test::fixed_width_column_wrapper<std::int64_t> column(values.begin(), values.end());
   cudf::table_view input{{column}};
-  auto expected = cudf::pack(input, stream_view, mr);
-  auto packed   = cudf::detail::pack_fused_for(input, stream_view, mr);
+  auto expected = cudf::pack(input, consumer_stream_view, mr);
+  auto packed   = cudf::detail::pack_fused_for(input, producer_stream_view, mr);
+  producer_stream.synchronize();
 
-  // decode_fused_for launches asynchronously and destroys the moved wire
-  // buffer on return. Its deallocation must remain ordered after the decode
-  // on this non-default stream.
-  auto decoded = cudf::detail::decode_fused_for(std::move(packed), stream_view, mr);
-  expect_packed_equivalent(expected, decoded, stream_view);
+  // decode_fused_for launches asynchronously on a stream other than the one
+  // that allocated the moved wire buffer. Its deallocation must follow the
+  // decode on the consumer stream.
+  auto decoded = cudf::detail::decode_fused_for(std::move(packed), consumer_stream_view, mr);
+  expect_packed_equivalent(expected, decoded, consumer_stream_view);
 }
 
 TEST_F(FusedForSplitTest, RoundTripsNullableSliceAcrossPartitions)

@@ -2970,6 +2970,10 @@ packed_columns decode_fused_for(fused_for_packed_columns&& input,
     util::round_up_safe(input.segment_count * sizeof(fused_for_segment), std::size_t{16});
   CUDF_EXPECTS(descriptor_size <= wire_size, "fused FOR descriptors exceed the wire buffer");
 
+  // The caller guarantees that the wire payload is ready on `stream`. Order
+  // its eventual deallocation after the asynchronous decode launched below.
+  input.wire_data->set_stream(stream);
+
   auto output = std::make_unique<rmm::device_buffer>(input.logical_data_size, stream, mr);
   if (input.segment_count != 0) {
     constexpr size_type block_size = 256;
