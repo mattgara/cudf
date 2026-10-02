@@ -271,115 +271,39 @@ std::size_t packed_size(
 namespace experimental {
 
 /**
- * @brief Compression algorithms supported by the prepared pack prototype.
+ * @brief nvCOMP Cascaded settings for compressing existing packed columns.
  */
-enum class pack_compression {
-  none,       ///< Preserve the current uncompressed packed representation
-  automatic,  ///< Select a codec independently for each physical region
-  cascaded,   ///< nvCOMP Cascaded with an NVCOMP_NATIVE self-describing bitstream
-  zstd,       ///< nvCOMP Zstd with an NVCOMP_NATIVE self-describing bitstream
-  snappy,     ///< nvCOMP Snappy with an NVCOMP_NATIVE self-describing bitstream
-};
-
-/**
- * @brief Physical role of a region presented to an expert codec selector.
- */
-enum class pack_region_kind {
-  data,              ///< Fixed-width or other ordinary column data
-  validity,          ///< Null-validity bitmask
-  offsets,           ///< String or list offsets
-  string_characters  ///< String character bytes
-};
-
-/**
- * @brief Read-only description passed to an expert per-region codec selector.
- */
-struct pack_region_info {
-  std::size_t region_index;        ///< Stable index within this prepared pack operation
-  size_type column_index;          ///< Top-level input column owning this region
-  pack_region_kind kind;           ///< Physical role of the region
-  type_id type;                    ///< Logical/native type used to configure the codec
-  std::size_t uncompressed_bytes;  ///< Bytes presented to the selected codec
-};
-
-/**
- * @brief Expert codec configuration for one physical packed region.
- *
- * `automatic` applies libcudf's built-in codec policy and permits compact output to fall back to
- * raw bytes when compression misses `minimum_savings_bytes`. A concrete codec forces that codec.
- */
-struct pack_region_options {
-  pack_compression codec{pack_compression::none};  ///< Codec for this region
+struct cascaded_pack_options {
   std::size_t compression_chunk_bytes{64 * 1024};  ///< nvCOMP chunk size
-  std::size_t minimum_savings_bytes{256};  ///< Minimum savings for `automatic` to keep compression
-  int cascaded_num_RLEs{2};                ///< Cascaded run-length encoding passes
-  int cascaded_num_deltas{1};              ///< Cascaded delta encoding passes
-  bool cascaded_use_bitpacking{true};      ///< Whether Cascaded applies bit-packing
+  int num_RLEs{2};                                 ///< Run-length encoding passes
+  int num_deltas{1};                               ///< Delta encoding passes
+  bool use_bitpacking{true};                       ///< Whether to bit-pack transformed values
 };
 
 /**
- * @brief Immutable region description and its mutable expert codec configuration.
- */
-struct pack_region {
-  pack_region_info const info;  ///< Read-only region description
-  pack_region_options options;  ///< Codec configuration applied to this region
-};
-
-/**
- * @brief Controls whether compressed execution reports the compact size immediately.
- */
-enum class compressed_output_mode {
-  compact,   ///< Synchronize and report the actual compressed prefix size
-  reserved,  ///< Remain asynchronous and retain the complete planned destination capacity
-};
-
-/**
- * @brief Options controlling a prepared pack operation.
- */
-struct pack_options {
-  pack_compression compression{pack_compression::none};                 ///< Codec for every region
-  compressed_output_mode output_mode{compressed_output_mode::compact};  ///< Size-reporting policy
-  std::size_t compression_chunk_bytes{64 * 1024};                       ///< nvCOMP chunk size
-  std::size_t automatic_min_region_bytes{4 * 1024};  ///< Smaller regions stay uncompressed
-  std::size_t automatic_min_savings_bytes{256};  ///< Minimum savings for `automatic` to compress
-  int cascaded_num_RLEs{2};                      ///< Cascaded run-length encoding passes
-  int cascaded_num_deltas{1};                    ///< Cascaded delta encoding passes
-  bool cascaded_use_bitpacking{true};            ///< Whether Cascaded applies bit-packing
-};
-
-/**
- * @brief Storage requirements for a prepared pack operation.
+ * @brief Device-storage requirements for a prepared Cascaded pack.
  */
 struct pack_sizes {
-  std::size_t metadata_bytes;     ///< Exact host metadata size
-  std::size_t payload_bytes;      ///< Required destination capacity (an upper bound if compressed)
-  std::size_t payload_alignment;  ///< Required alignment for the payload base address
-  std::size_t uncompressed_payload_bytes;  ///< Exact contiguous size before compression
+  std::size_t payload_bytes;               ///< Required destination capacity
+  std::size_t uncompressed_payload_bytes;  ///< Original packed allocation size
 };
 
 struct pack_result;
-class pack_plan_builder;
 
 /**
- * @brief Prepared state for repeatedly packing one table into caller-owned memory.
+ * @brief Prepared Cascaded compression of an existing `packed_columns` allocation.
  *
- * Construction performs layout planning once. The input table or packed columns, their metadata,
- * and all referenced buffers must remain alive and unchanged until every operation using the plan
- * has completed. A plan is bound to the stream passed to `prepare_pack()`.
+ * The input and its buffers must remain alive and unchanged until work submitted
+ * by `pack_into()` on the preparation stream has completed.
  */
 class pack_plan {
  public:
   pack_plan(pack_plan const&)            = delete;
   pack_plan& operator=(pack_plan const&) = delete;
-  pack_plan(pack_plan&&) noexcept;             ///< Move constructor
-  pack_plan& operator=(pack_plan&&) noexcept;  ///< Move assignment @return `*this`
+  pack_plan(pack_plan&&) noexcept;
+  pack_plan& operator=(pack_plan&&) noexcept;
   ~pack_plan();
 
-  /**
-   * @brief Return the exact storage requirements for this plan.
-   *
-   * @return Metadata and payload sizes and the payload alignment
-   */
   [[nodiscard]] pack_sizes sizes() const;
 
  private:
@@ -388,198 +312,51 @@ class pack_plan {
 
   explicit pack_plan(std::unique_ptr<impl>&& implementation);
 
-  friend pack_plan prepare_pack(cudf::table_view const&,
-                                cuda::stream_ref,
-                                rmm::device_async_resource_ref);
-  friend pack_plan prepare_pack(cudf::table_view const&,
-                                pack_options const&,
-                                cuda::stream_ref,
-                                rmm::device_async_resource_ref);
   friend pack_plan prepare_pack(cudf::packed_columns const&,
-                                pack_options const&,
+                                cascaded_pack_options const&,
                                 cuda::stream_ref,
                                 rmm::device_async_resource_ref);
-  friend class pack_plan_builder;
   friend pack_result pack_into(pack_plan const&, cudf::device_span<uint8_t>);
 };
 
 /**
- * @brief Two-stage expert configuration for a prepared pack operation.
- *
- * The builder discovers physical regions once. Callers may edit only `pack_region::options`; the
- * descriptions remain immutable. `build()` finalizes compressor state and destination capacity.
- */
-class pack_plan_builder {
- public:
-  pack_plan_builder(pack_plan_builder const&)            = delete;
-  pack_plan_builder& operator=(pack_plan_builder const&) = delete;
-  pack_plan_builder(pack_plan_builder&&) noexcept;             ///< Move constructor
-  pack_plan_builder& operator=(pack_plan_builder&&) noexcept;  ///< Move assignment @return `*this`
-  ~pack_plan_builder();
-
-  [[nodiscard]] std::span<pack_region> regions();              ///< @return Editable regions
-  [[nodiscard]] std::span<pack_region const> regions() const;  ///< @return Read-only regions
-  [[nodiscard]] pack_plan build() &&;  ///< Consume the builder @return The configured plan
-
- private:
-  struct impl;
-  std::unique_ptr<impl> _impl;
-
-  explicit pack_plan_builder(std::unique_ptr<impl>&& implementation);
-
-  friend pack_plan_builder make_pack_plan_builder(cudf::table_view const&,
-                                                  pack_options const&,
-                                                  cuda::stream_ref,
-                                                  rmm::device_async_resource_ref);
-  friend pack_plan_builder make_pack_plan_builder(cudf::packed_columns const&,
-                                                  pack_options const&,
-                                                  cuda::stream_ref,
-                                                  rmm::device_async_resource_ref);
-};
-
-/**
- * @brief Discover configurable physical regions for expert per-region codec selection.
- *
- * Each region initially inherits the codec and codec parameters in `options`. Callers may edit the
- * returned regions before consuming the builder with `build()`.
- *
- * @param input View of the table to pack
- * @param options Default codec options for every region
- * @param stream Stream used for planning and subsequent `pack_into()` operations
- * @param temp_mr Memory resource used for planning and compression staging allocations
- * @return A builder exposing the discovered regions
- */
-pack_plan_builder make_pack_plan_builder(
-  cudf::table_view const& input,
-  pack_options const& options            = {},
-  cuda::stream_ref stream                = cudf::get_default_stream(),
-  rmm::device_async_resource_ref temp_mr = cudf::get_current_device_resource_ref());
-
-/**
- * @brief Discover configurable regions in an existing uncompressed packed allocation.
+ * @brief Prepare Cascaded compression of existing packed columns.
  *
  * @param input Existing ordinary, uncompressed packed columns
- * @param options Default codec options for every region
- * @param stream Stream used for planning and subsequent `pack_into()` operations
+ * @param options Cascaded codec options
+ * @param stream Stream used for planning and subsequent `pack_into()` work
  * @param temp_mr Memory resource used for codec workspace allocations
- * @return A builder exposing the discovered regions
- */
-pack_plan_builder make_pack_plan_builder(
-  cudf::packed_columns const& input,
-  pack_options const& options,
-  cuda::stream_ref stream                = cudf::get_default_stream(),
-  rmm::device_async_resource_ref temp_mr = cudf::get_current_device_resource_ref());
-
-/**
- * @brief Prepare an exact, reusable uncompressed pack plan for `input`.
- *
- * @param input View of the table to pack
- * @param stream Stream used for planning and subsequent `pack_into()` operations
- * @param temp_mr Memory resource used for planning scratch allocations
  * @return A move-only plan bound to `input` and `stream`
  */
 pack_plan prepare_pack(
-  cudf::table_view const& input,
-  cuda::stream_ref stream                = cudf::get_default_stream(),
-  rmm::device_async_resource_ref temp_mr = cudf::get_current_device_resource_ref());
-
-/**
- * @brief Prepare a reusable pack plan with explicit compression options.
- *
- * Compression first creates the normalized contiguous representation, then independently
- * compresses each physical column buffer (data, offsets, characters, or validity) as an nvCOMP
- * native bitstream. Cascaded is configured with the native width and signedness of each region
- * when nvCOMP supports it. `sizes().payload_bytes` is the combined upper-bound capacity;
- * `pack_into()` reports either the compact prefix or reserved capacity selected by `options`.
- *
- * @param input View of the table to pack
- * @param options Compression and codec options
- * @param stream Stream used for planning and subsequent `pack_into()` operations
- * @param temp_mr Memory resource used for planning and compression staging allocations
- * @return A move-only plan bound to `input` and `stream`
- */
-pack_plan prepare_pack(
-  cudf::table_view const& input,
-  pack_options const& options,
-  cuda::stream_ref stream                = cudf::get_default_stream(),
-  rmm::device_async_resource_ref temp_mr = cudf::get_current_device_resource_ref());
-
-/**
- * @brief Prepare compression of an existing uncompressed `cudf::packed_columns` allocation.
- *
- * This overload supports callers that decide whether to compress only after ordinary packing has
- * completed. It borrows `input.gpu_data` as the compression source and therefore avoids copying or
- * repacking the column data. The ordinary pack metadata is retained inside the compressed
- * representation for reconstruction by `materialize()`.
- *
- * `options.compression` must select a compressed representation. The input metadata and device
- * allocation must remain alive and unchanged until every execution using the returned plan has
- * completed.
- *
- * @param input Existing ordinary, uncompressed packed columns
- * @param options Compression and output-layout options
- * @param stream Stream used for planning and subsequent `pack_into()` operations
- * @param temp_mr Memory resource used for codec workspace allocations
- * @return A move-only plan that borrows `input` and is bound to `stream`
- */
-pack_plan prepare_pack(
   cudf::packed_columns const& input,
-  pack_options const& options,
+  cascaded_pack_options const& options   = {},
   cuda::stream_ref stream                = cudf::get_default_stream(),
   rmm::device_async_resource_ref temp_mr = cudf::get_current_device_resource_ref());
 
 /**
- * @brief Host metadata and payload size produced by `pack_into()`.
+ * @brief Metadata and compact payload size produced by `pack_into()`.
  */
 struct pack_result {
-  std::vector<uint8_t> metadata;       ///< Metadata describing the packed payload
-  std::size_t payload_bytes;           ///< Bytes to retain: actual prefix or reserved capacity
-  pack_compression compression;        ///< Representation used by the payload
-  compressed_output_mode output_mode;  ///< Size-reporting policy used for this result
+  std::vector<uint8_t> metadata;  ///< Metadata describing the compressed payload
+  std::size_t payload_bytes;      ///< Compressed prefix bytes to retain
 };
 
 /**
- * @brief Execute a prepared pack directly into caller-owned device-accessible memory.
- *
- * `destination` may be device memory or mapped pinned-host memory. It must contain at least
- * `plan.sizes().payload_bytes` bytes. Work is submitted to the stream captured by the plan.
- * The caller must preserve the input and destination until that stream reaches the operation.
- *
- * The same plan may be executed repeatedly while its input remains valid and unchanged.
- *
- * @param plan Prepared pack plan
- * @param destination Caller-owned output span
- * @return Host metadata and the number of payload bytes written
+ * @brief Compress a prepared pack into caller-owned device memory.
  */
 pack_result pack_into(pack_plan const& plan, cudf::device_span<uint8_t> destination);
 
 /**
- * @brief Non-owning view of packed host metadata and device-accessible payload bytes.
+ * @brief Non-owning view of Cascaded metadata and device payload bytes.
  */
 struct packed_data_view {
-  std::span<uint8_t const> metadata;                     ///< Host metadata from `pack_into()`
-  cudf::device_span<uint8_t const> payload;              ///< Device-accessible payload bytes
-  pack_compression compression{pack_compression::none};  ///< Representation of `payload`
+  std::span<uint8_t const> metadata;
+  cudf::device_span<uint8_t const> payload;
 };
 
 /**
- * @brief Construct a zero-copy table view over an uncompressed packed payload.
- *
- * The returned view must not outlive either buffer in `input`.
- * Compressed inputs must be passed to `materialize()` instead.
- *
- * @param input Packed metadata and payload
- * @return A non-owning table view into `input.payload`
- */
-table_view unpack_view(packed_data_view input);
-
-/**
- * @brief Materialize an owning table from any supported packed representation.
- *
- * @param input Packed metadata and payload
- * @param stream Stream used for the deep copy
- * @param mr Memory resource for the returned table
- * @return An owning table independent of the packed buffers
+ * @brief Materialize an owning table from a Cascaded packed representation.
  */
 std::unique_ptr<table> materialize(
   packed_data_view input,
@@ -693,14 +470,12 @@ class packed_metadata_view {
     [[nodiscard]] size_type null_count() const;
 
     /**
-     * @brief @return Byte offset of this column's data in the uncompressed packed payload, or -1
-     * if the column has no data buffer.
+     * @brief @return Byte offset of this column's data in the packed payload, or -1 if absent.
      */
     [[nodiscard]] int64_t data_offset() const;
 
     /**
-     * @brief @return Byte offset of this column's validity mask in the uncompressed packed
-     * payload, or -1 if the column is not nullable.
+     * @brief @return Byte offset of this column's validity mask, or -1 if absent.
      */
     [[nodiscard]] int64_t null_mask_offset() const;
 
