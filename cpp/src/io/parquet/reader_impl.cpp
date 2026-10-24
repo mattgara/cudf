@@ -19,6 +19,7 @@
 #include <cudf/io/parquet_schema.hpp>
 #include <cudf/logger.hpp>
 #include <cudf/null_mask.hpp>
+#include <cudf/reduction/detail/reduction.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/strings/detail/utilities.hpp>
 #include <cudf/unary.hpp>
@@ -926,6 +927,26 @@ column_selection_options reader_impl::make_column_selection_options(
     .case_sensitive_names   = options.is_enabled_case_sensitive_names()};
 }
 
+namespace {
+
+/**
+ * @brief Whether a boolean retention mask keeps every row: it has no nulls and no false values
+ */
+bool retains_all_rows(column_view const& mask, cuda::stream_ref stream)
+{
+  if (mask.null_count() != 0) { return false; }
+  if (mask.is_empty()) { return true; }
+  auto const all = cudf::reduction::detail::reduce(mask,
+                                                   *make_all_aggregation<reduce_aggregation>(),
+                                                   data_type{type_id::BOOL8},
+                                                   std::nullopt,
+                                                   stream,
+                                                   cudf::get_current_device_resource_ref());
+  return static_cast<numeric_scalar<bool> const&>(*all).value(stream);
+}
+
+}  // namespace
+
 table_with_metadata reader_impl::finalize_output(read_mode mode,
                                                  table_metadata& out_metadata,
                                                  std::vector<std::unique_ptr<column>>& out_columns)
@@ -1022,25 +1043,29 @@ table_with_metadata reader_impl::finalize_output(read_mode mode,
 
     bool use_jit = cudf::get_context().use_jit() || _options.use_jit_filter;
 
-    if (!use_jit) {
-      auto predicate =
-        cudf::detail::compute_column(*read_table, final_filter_expr.value().get(), _stream, _mr);
-      CUDF_EXPECTS(predicate->view().type().id() == type_id::BOOL8,
-                   "Predicate filter should return a boolean");
-      // Exclude columns present in filter only in output
-      auto output_table = cudf::detail::apply_mask(
-        only_output, *predicate, cudf::detail::mask_type::RETENTION, _stream, _mr);
-      return {encode_output_dict_columns(std::move(output_table)), std::move(out_metadata)};
-    } else {
-      auto predicate =
-        cudf::compute_column_jit(read_table->view(), final_filter_expr.value().get(), _stream, _mr);
-      CUDF_EXPECTS(predicate->view().type().id() == type_id::BOOL8,
-                   "Predicate filter should return a boolean");
-      // Exclude columns present in filter only in output
-      auto output_table = cudf::apply_retention_mask(only_output, predicate->view(), _stream, _mr);
+    auto const predicate =
+      use_jit
+        ? cudf::compute_column_jit(read_table->view(), final_filter_expr.value().get(), _stream, _mr)
+        : cudf::detail::compute_column(*read_table, final_filter_expr.value().get(), _stream, _mr);
+    CUDF_EXPECTS(predicate->view().type().id() == type_id::BOOL8,
+                 "Predicate filter should return a boolean");
 
-      return {encode_output_dict_columns(std::move(output_table)), std::move(out_metadata)};
+    // When every row passes the filter, the decoded columns are the output. Return them instead of
+    // applying the mask, which copies the whole table when everything is selected.
+    if (retains_all_rows(predicate->view(), _stream)) {
+      auto columns = read_table->release();
+      // Exclude columns present in filter only in output
+      columns.resize(output_count);
+      return {encode_output_dict_columns(std::make_unique<table>(std::move(columns))),
+              std::move(out_metadata)};
     }
+
+    // Exclude columns present in filter only in output
+    auto output_table =
+      use_jit ? cudf::apply_retention_mask(only_output, predicate->view(), _stream, _mr)
+              : cudf::detail::apply_mask(
+                  only_output, *predicate, cudf::detail::mask_type::RETENTION, _stream, _mr);
+    return {encode_output_dict_columns(std::move(output_table)), std::move(out_metadata)};
   }
   return {encode_output_dict_columns(std::make_unique<table>(std::move(out_columns))),
           std::move(out_metadata)};
